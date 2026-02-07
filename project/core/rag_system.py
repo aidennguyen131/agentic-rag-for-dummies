@@ -1,5 +1,5 @@
 import uuid
-from langchain_ollama import ChatOllama
+# from langchain_ollama import ChatOllama
 import config
 from db.vector_db_manager import VectorDbManager
 from db.parent_store_manager import ParentStoreManager
@@ -21,7 +21,22 @@ class RAGSystem:
         self.vector_db.create_collection(self.collection_name)
         collection = self.vector_db.get_collection(self.collection_name)
         
-        llm = ChatOllama(model=config.LLM_MODEL, temperature=config.LLM_TEMPERATURE)
+        import os
+        from dotenv import load_dotenv, find_dotenv
+        
+        # Load environment variables from .env file
+        load_dotenv(find_dotenv(), override=True)
+        
+        if config.LLM_PROVIDER == "openai":
+            from langchain_openai import ChatOpenAI
+            llm = ChatOpenAI(model=config.LLM_MODEL, temperature=config.LLM_TEMPERATURE)
+        elif config.LLM_PROVIDER == "google":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(model=config.LLM_MODEL, temperature=config.LLM_TEMPERATURE)
+        else:
+            from langchain_ollama import ChatOllama
+            llm = ChatOllama(model=config.LLM_MODEL, temperature=config.LLM_TEMPERATURE)
+            
         tools = ToolFactory(collection).create_tools()
         self.agent_graph = create_agent_graph(llm, tools)
         
