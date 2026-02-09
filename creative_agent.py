@@ -30,19 +30,44 @@ class CreativeAgent:
 
     def analyze_image(self, image_path):
         print(f"Analyzing image: {image_path}...")
+        
+        from pydantic import BaseModel, Field
+        from typing import List
+
+        class VisionAnalysis(BaseModel):
+            subject: str = Field(description="The main character or subject")
+            action: str = Field(description="What the subject is doing")
+            context: str = Field(description="Environment, background, or setting")
+            art_style: str = Field(description="The visual style (e.g. vintage, vector, photo-real)")
+            colors: str = Field(description="Dominant colors and palette description")
+            mood: str = Field(description="The emotional tone (e.g. funny, scary, serious)")
+            key_elements: List[str] = Field(description="List of other important visual elements")
+
         base64_image = self.encode_image(image_path)
         
         message = HumanMessage(
             content=[
-                {"type": "text", "text": "Analyze this image for a T-shirt design. Describe the Subject, Art Style, Colors, Mood, and Key Visual Elements. Be concise but descriptive."},
+                {"type": "text", "text": "Analyze this image for a T-shirt design. Extract the following specific details:"},
                 {
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
                 },
             ]
         )
-        response = self.vision_llm.invoke([message])
-        return response.content
+        # Use structured output
+        structured_llm = self.vision_llm.with_structured_output(VisionAnalysis)
+        response = structured_llm.invoke([message])
+        
+        # Return the dict, or handle it in run()
+        # For compatibility with existing string-based flow, we might need to adjust,
+        # but let's return the dict object so we can pass it to frontend.
+        # However, mix_and_create expects a description string.
+        # We should return the dict, and let caller handle it.
+        # Wait, if we change return type, we break mix_and_create which expects a string description?
+        # Let's check mix_and_create usage. It uses 'description' in prompt. 
+        # We can accept dict in mix_and_create or convert dict to string there.
+        # Let's return the object (Pydantic model) and convert to string where needed.
+        return response
 
     def retrieve_ideas(self, description, user_instruction=None):
         print("Retrieving related concepts from RAG...")
@@ -71,9 +96,17 @@ class CreativeAgent:
 
         class Concept(BaseModel):
             title: str = Field(description="Catchy title for the T-shirt design")
-            visual_prompt: str = Field(description="Detailed prompt for AI image generator")
+            visual_prompt: str = Field(description="Full prompt for AI image generator")
+            # Structured breakdown
+            subject: str = Field(description="The main character/subject")
+            action: str = Field(description="What the subject is doing")
+            context: str = Field(description="Environment or background elements")
+            art_style: str = Field(description="The specific art style used")
+            colors: str = Field(description="The color palette used")
+            
             caption: str = Field(description="Text or slogan on the shirt")
             logic: str = Field(description="Business logic or why this design works")
+            focus: str = Field(description="The specific element that was changed, e.g., 'Subject', 'Action', 'Style', 'Context'")
 
         class DesignConcepts(BaseModel):
             concepts: List[Concept]
@@ -87,27 +120,59 @@ class CreativeAgent:
         Inspiration from our Database (Trending Keywords/Styles):
         {rag_ideas}
         
+        Task:
+        Create 4 DISTINCT T-shirt design concepts based on the following specific strategies:
+        
+        1. **Concept 1: The Subject Twist**
+           - **CRITICAL**: Look at the "Action" identified in the image analysis.
+           - **KEEP THIS ACTION** exactly as is.
+           - **CHANGE THE SUBJECT** to a completely different character based on RAG keywords (e.g. Instead of Bigfoot holding a sausage, make it a T-Rex holding a sausage).
+           
+        2. **Concept 2: The Action Switch**
+           - **CRITICAL**: Keep the **ORIGINAL SUBJECT**.
+           - **CHANGE THE ACTION** to something unexpected, funny, or trending (e.g. skateboarding, gaming, drinking boba).
+           
+        3. **Concept 3: The Visual Remix (Style + Color)**
+           - Keep the original subject and action.
+           - **CHANGE THE ART STYLE AND COLORS** together. Use a trending style (e.g. Kawaii, Vaporwave, Glitch Art) AND a matching unique color palette.
+           
+        4. **Concept 4: The Context Shift**
+           - Keep the original subject and action.
+           - **CHANGE THE CONTEXT/BACKGROUND** to a completely different setting (e.g. Outer Space, Underwater, Cyberpunk City, Ancient Rome).
         """
         
         if user_instruction:
             prompt += f"""
+            
             IMMEDIATE USER INSTRUCTION:
             "{user_instruction}"
-            (You MUST strictly follow this instruction. If it asks to change style, change style. If it asks for specific subject, ignore RAG data if it conflicts.)
+            
+            CRITICAL OVERRIDE: 
+            If the user instruction starts with "Refining concept...", it means they want to IMPROVE a specific concept they already saw.
+            In this case:
+            1. **FOCUS ONLY ON THAT CONCEPT'S CORE IDEA**.
+            2. **APPLY THE USER'S REQUESTED CHANGE AS THE NEW TRUTH**.
+               - If the user asks to "change action to dancing", the new Action IS "dancing". **DO NOT** keep the old action.
+               - If the user asks to "change subject to a cat", the new Subject IS "cat". **DO NOT** keep the old subject.
+            3. Generate 3 VARIATIONS of this *refined* concept (e.g. 3 different ways to show the T-Rex dancing).
+            4. You can ignore the strict "Subject/Style/Color" split if it doesn't make sense for a refinement, BUT try to keep diversity in the details.
             """
             
         prompt += """
-        Task:
-        Create 3 unique, creative T-shirt design concepts that **ACTIVELY MASH UP** the original subject with the retrieved keywords/styles.
         
-        CRITICAL INSTRUCTION:
-        - DO NOT just describe the original image in more detail.
-        - DO NOT just add the style as a filter.
-        - **COMBINE** concepts to create something new. (e.g., If Image is "Cat" and Keyword is "Ramen", make "Cat eating Ramen" or "Ramen made of Yarn").
-        - Use **Surprise** and **Humor**.
-        - Aim for "Visual Puns" or "Ironic Juxtapositions".
-        
-        Make them funny, catchy, and market-ready.
+        Output Format:
+        Return a JSON with 4 concepts.
+        For each concept, provide:
+        - title: Catchy name
+        - visual_prompt: The full, detailed prompt for generation.
+        - subject: The specific subject (e.g. "T-Rex").
+        - action: The specific action (e.g. "holding a sausage").
+        - context: Background/Environment details.
+        - art_style: The art style used.
+        - colors: The color palette.
+        - caption: Text for the shirt.
+        - logic: Explain WHICH strategy you used (Subject Twist, Style Shift, or Color Pop) and why.
+        - focus: ONE word indicating the main change: "Subject", "Action", "Style", or "Context".
         """
         
         structured_llm = self.creative_llm.with_structured_output(DesignConcepts)
@@ -115,26 +180,28 @@ class CreativeAgent:
         return response.concepts
 
     def run(self, image_path, user_instruction=None):
-        # 1. Vision (Cache this if optimizing, but cheap enough to re-run or just pass description if we structured it better)
-        # For simplicity, we re-analyze or assumed the caller might optimize. 
-        # Actually, let's just re-run vision for now to be stateless-ish, or better: 
-        # Ideally we pass the description in if we have it, but image_path is the interface.
-        description = self.analyze_image(image_path)
-        print(f"\n[Vision Analysis]\n{description}\n")
+        # 1. Vision Analysis (Structured)
+        vision_analysis = self.analyze_image(image_path)
         
-        # 2. RAG
-        rag_ideas = self.retrieve_ideas(description, user_instruction)
-        print(f"\n[RAG Suggestions]\n{rag_ideas}\n")
+        # Convert to string for downstream tasks
+        if hasattr(vision_analysis, 'model_dump_json'):
+             description_str = vision_analysis.model_dump_json()
+             analysis_dict = vision_analysis.model_dump()
+        else:
+             description_str = str(vision_analysis)
+             analysis_dict = {"raw_text": description_str} # Fallback
+             
+        # 2. RAG Retrieval
+        rag_ideas = self.retrieve_ideas(vision_analysis, user_instruction)
         
-        # 3. Creative Mix
-        final_concepts = self.mix_and_create(description, rag_ideas, user_instruction)
-        print(f"\n[Final Concepts]\n{final_concepts}\n")
+        # 3. Creative Generation
+        concepts = self.mix_and_create(description_str, rag_ideas, user_instruction)
         
-        # Return dict for API
         return {
-            "vision_analysis": description,
-            "rag_suggestions": rag_ideas,
-            "concepts": [c.dict() for c in final_concepts]
+            "analysis": description_str, # Keep string for backward compat if needed, or update frontend to use 'vision_analysis'
+            "vision_analysis": analysis_dict, # Pass structured data
+            "rag_context": rag_ideas,
+            "concepts": [c.model_dump() for c in concepts]
         }
 
     def remix_concept(self, original_concept: dict):
@@ -145,37 +212,60 @@ class CreativeAgent:
         class Concept(BaseModel):
             title: str = Field(description="Catchy title for the T-shirt design")
             visual_prompt: str = Field(description="Detailed prompt for AI image generator")
+            subject: str = Field(description="The specific subject")
+            action: str = Field(description="The specific action")
+            context: str = Field(description="Environment or background")
+            art_style: str = Field(description="The art style")
+            colors: str = Field(description="The color palette")
             caption: str = Field(description="Text or slogan on the shirt")
             logic: str = Field(description="Why this variation works")
+            focus: str = Field(description="The specific element that was changed")
 
         class DesignConcepts(BaseModel):
             concepts: List[Concept]
 
+        focus_area = original_concept.get('focus', 'General')
+        
+        # tailoring the prompt based on what kind of concept this is
+        specific_instruction = ""
+        if focus_area == 'Subject':
+            specific_instruction = "This concept was about a Subject Twist. Create 1 NEW VARIATION with a **DIFFERENT SUBJECT** performing the SAME Action. **CRITICAL: You MUST KEEP the original Action, Context, Art Style, and Colors EXACTLY AS IS.**"
+        elif focus_area == 'Action':
+            specific_instruction = "This concept was about an Action Switch. Create 1 NEW VARIATION with the SAME Subject performing a **DIFFERENT ACTION**. **CRITICAL: You MUST KEEP the original Subject, Context, Art Style, and Colors EXACTLY AS IS.**"
+        elif focus_area == 'Style' or focus_area == 'Visual':
+            specific_instruction = "This concept was about a Visual Remix. Create 1 NEW VARIATION with the SAME Subject/Action/Context but a **DIFFERENT ART STYLE AND COLOR PALETTE**. **CRITICAL: You MUST KEEP the original Subject, Action, and Context EXACTLY AS IS.**"
+        elif focus_area == 'Context':
+            specific_instruction = "This concept was about a Context Shift. Create 1 NEW VARIATION with the SAME Subject/Action but in a **DIFFERENT CONTEXT**. **CRITICAL: You MUST KEEP the original Subject, Action, Art Style, and Colors EXACTLY AS IS.**"
+        else:
+             specific_instruction = "Create 1 BOLD variation of this concept using SCAMPER techniques."
+
         prompt = f"""
         You are a Creative Director for a POD T-shirt business.
-        We have a successful design concept, and we want 3 DISTINCT variations or "remixes" of it.
         
         Original Concept:
         Title: {original_concept.get('title')}
         Visual: {original_concept.get('visual_prompt')}
         Caption: {original_concept.get('caption')}
+        Subject: {original_concept.get('subject')}
+        Action: {original_concept.get('action')}
+        Context: {original_concept.get('context')}
+        Art Style: {original_concept.get('art_style')}
+        Colors: {original_concept.get('colors')}
+        Focus: {focus_area}
         
         Task:
-        Create 3 BOLD variations using **SCAMPER** techniques (Substitute, Combine, Adapt, Modify, Put to other use, Eliminate, Reverse).
+        {specific_instruction}
         
         CRITICAL RULES:
-        1. **NO MORE DETAIL**: Do not just add adjectives or make the description longer.
-        2. **CHANGE THE ANGLE**:
-           - **Variation 1 (The Mashup)**: Combine the subject with a completely different object or hobby (e.g., Coffee, Gym, Gaming, Space).
-           - **Variation 2 (The Role Reverse)**: Put the subject in an unexpected human situation or ironic context.
-           - **Variation 3 (The Style Twist)**: Keep the subject but radically change the art style (e.g., from Vintage to Kawaii, or Realistic to Minimalist line art).
-        
-        3. **NEW CAPTIONS**: You MUST change the caption to match the new twist.
+        1. **Generate ONLY 1 Concept**.
+        2. **STRICTLY Maintain Non-Focus Elements**: If the focus is Context, DO NOT change the Art Style or Subject. If the focus is Action, DO NOT change the Context.
+        3. **New Caption**: Update the caption to match the new variation.
+        4. **Detailed Visual Prompt**: Write a full prompt for image generation that explicitly describes the elements to keep.
         """
         
         structured_llm = self.creative_llm.with_structured_output(DesignConcepts)
         response = structured_llm.invoke([HumanMessage(content=prompt)])
-        return [c.dict() for c in response.concepts]
+        return [c.model_dump() for c in response.concepts]
 
 if __name__ == "__main__":
     # Test with a dummy image path or ask user
