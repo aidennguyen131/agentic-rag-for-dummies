@@ -13,6 +13,11 @@ from core.rag_system import RAGSystem
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 import config
+import csv
+import re
+import json
+from pydantic import BaseModel
+from typing import List
 
 class CreativeAgent:
     def __init__(self):
@@ -89,7 +94,7 @@ class CreativeAgent:
         final_message = result["messages"][-1]
         return final_message.content
 
-    def mix_and_create(self, description, rag_ideas, user_instruction=None):
+    def mix_and_create(self, description, rag_ideas, user_instruction=None, selected_keywords=None):
         print("Mixing ideas...")
         from pydantic import BaseModel, Field
         from typing import List
@@ -111,6 +116,10 @@ class CreativeAgent:
         class DesignConcepts(BaseModel):
             concepts: List[Concept]
 
+        keywords_context = ""
+        if selected_keywords and len(selected_keywords) > 0:
+            keywords_context = f"\n\n**MANDATORY USER SELECTED KEYWORDS/NICHES**:\nThe user has explicitly selected these keywords to focus on: {', '.join(selected_keywords)}.\nENSURE these keywords are heavily integrated into the concepts (either as subjects, themes, or puns)."
+
         prompt = f"""
         You are a Creative Director for a POD (Print on Demand) T-shirt business.
         
@@ -119,6 +128,7 @@ class CreativeAgent:
         
         Inspiration from our Database (Trending Keywords/Styles):
         {rag_ideas}
+        {keywords_context}
         
         Task:
         Create 4 DISTINCT T-shirt design concepts based on the following specific strategies:
@@ -204,7 +214,7 @@ class CreativeAgent:
             "concepts": [c.model_dump() for c in concepts]
         }
 
-    def remix_concept(self, original_concept: dict):
+    def remix_concept(self, original_concept: dict, allowed_keywords: List[str] = None):
         print(f"Remixing concept: {original_concept.get('title')}...")
         from pydantic import BaseModel, Field
         from typing import List
@@ -229,7 +239,11 @@ class CreativeAgent:
         # tailoring the prompt based on what kind of concept this is
         specific_instruction = ""
         if focus_area == 'Subject':
-            specific_instruction = "This concept was about a Subject Twist. Create 1 NEW VARIATION with a **DIFFERENT SUBJECT** performing the SAME Action. **CRITICAL: You MUST KEEP the original Action, Context, Art Style, and Colors EXACTLY AS IS.**"
+            keyword_constraint = ""
+            if allowed_keywords and len(allowed_keywords) > 0:
+                 keyword_constraint = f" The NEW SUBJECT MUST be chosen from this list: {', '.join(allowed_keywords)}."
+            
+            specific_instruction = f"This concept was about a Subject Twist. Create 1 NEW VARIATION with a **DIFFERENT SUBJECT** performing the SAME Action.{keyword_constraint} **CRITICAL: You MUST KEEP the original Action, Context, Art Style, and Colors EXACTLY AS IS.**"
         elif focus_area == 'Action':
             specific_instruction = "This concept was about an Action Switch. Create 1 NEW VARIATION with the SAME Subject performing a **DIFFERENT ACTION**. **CRITICAL: You MUST KEEP the original Subject, Context, Art Style, and Colors EXACTLY AS IS.**"
         elif focus_area == 'Style' or focus_area == 'Visual':
@@ -266,6 +280,75 @@ class CreativeAgent:
         structured_llm = self.creative_llm.with_structured_output(DesignConcepts)
         response = structured_llm.invoke([HumanMessage(content=prompt)])
         return [c.model_dump() for c in response.concepts]
+
+    def get_preset_keywords(self):
+        """Extracts keywords from the local CSV file."""
+        csv_path = os.path.join(base_dir, "..", "50Topics_Keyword.csv")
+        keywords = []
+        try:
+            if not os.path.exists(csv_path):
+                print(f"CSV not found at {csv_path}")
+                return []
+                
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+                for line in content.split('\n'):
+                    line = line.strip()
+                    if not line: continue
+                    
+                    # Exclude headers
+                    if line.startswith("Dưới đây là") or line.startswith("Các Từ khóa"): continue
+                    if re.match(r'^\d+\.', line) and " – " not in line: continue
+                    
+                    keyword = None
+                    if " – " in line:
+                        keyword = line.split(" – ")[0]
+                    elif " - " in line:
+                        keyword = line.split(" - ")[0]
+                    elif ":" in line:
+                        parts = line.split(":")
+                        if len(parts[0]) < 30: keyword = parts[0]
+                    
+                    if keyword:
+                        clean_kw = re.sub(r'^\d+\.\s*', '', keyword).strip()
+                        if clean_kw and len(clean_kw) < 50:
+                            keywords.append(clean_kw)
+        except Exception as e:
+            print(f"Error reading preset keywords: {e}")
+            return []
+            
+        # Shuffle and return a subset (e.g. 10) to add variety
+        import random
+        random.shuffle(keywords)
+        return keywords[:10]
+
+    def get_viral_keywords(self, vision_analysis_str):
+        """Uses RAG to find viral keywords and returns them as a structured list."""
+        # 1. Get loose ideas from RAG
+        rag_text = self.retrieve_ideas(vision_analysis_str)
+        
+        # 2. Use LLM to extract/refine into a clean list
+        # 2. Use LLM to extract/refine into a clean list
+        class KeywordList(BaseModel):
+            keywords: List[str]
+            
+        extraction_prompt = f"""
+        Based on the following RAG research text, extract the top 5-10 most relevant, viral, and funny T-shirt keywords or short phrases.
+        
+        RAG Research:
+        {rag_text}
+        
+        Return ONLY the list of keywords.
+        """
+        
+        structured_llm = self.vision_llm.with_structured_output(KeywordList)
+        try:
+            response = structured_llm.invoke([HumanMessage(content=extraction_prompt)])
+            return {"rag_text": rag_text, "keywords": response.keywords}
+        except Exception as e:
+            print(f"Error extracting keywords: {e}")
+            return {"rag_text": rag_text, "keywords": []}
 
 if __name__ == "__main__":
     # Test with a dummy image path or ask user
