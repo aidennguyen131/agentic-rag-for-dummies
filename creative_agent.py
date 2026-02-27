@@ -25,13 +25,19 @@ class CreativeAgent:
         self.rag = RAGSystem()
         self.rag.initialize()
         
-        # Initialize Vision LLM (OpenAI GPT-4o-mini is cost effective and good)
-        self.vision_llm = ChatOpenAI(model="gpt-4o-mini", max_tokens=500)
-        self.creative_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        # Initialize Vision LLM (migrated to Gemini 3.0 Pro)
+        self.vision_llm = ChatGoogleGenerativeAI(model="gemini-3-pro-preview", max_tokens=2000)
+        self.creative_llm = ChatGoogleGenerativeAI(model="gemini-3-pro-preview", temperature=0.3)
 
     def encode_image(self, image_path):
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if not mime_type:
+            mime_type = "image/jpeg"
         with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
+            b64 = base64.b64encode(image_file.read()).decode('utf-8')
+            return f"data:{mime_type};base64,{b64}"
 
     def analyze_image(self, image_path):
         print(f"Analyzing image: {image_path}...")
@@ -47,15 +53,22 @@ class CreativeAgent:
             colors: str = Field(description="Dominant colors and palette description")
             mood: str = Field(description="The emotional tone (e.g. funny, scary, serious)")
             key_elements: List[str] = Field(description="List of other important visual elements")
+            visual_prompt: str = Field(description="A highly detailed cohesive text-to-image prompt")
 
-        base64_image = self.encode_image(image_path)
+        image_data_url = self.encode_image(image_path)
         
+        prompt_instruction = """Analyze this image for a T-shirt design. Provide the results in JSON format matching the schema.
+For the 'visual_prompt' field, create a highly detailed cohesive text-to-image prompt. 
+Example of desired format for visual_prompt:
+'A high-quality vector mascot art of a fierce brown bear dressed as a Japanese Samurai. The bear has an intense, angry expression and is wearing detailed black and red samurai armor with a traditional kabuto helmet featuring golden ornaments. The bear is wielding a sharp Katana sword in a dynamic pose. Behind the bear is a large solid red sun. In the foreground and background, there are cherry blossom branches with pink flowers and falling petals. Four black crows are flying around the scene. Clean bold outlines, flat colors with professional cel-shading, white background, symmetrical composition, 2D cartoon style, high contrast, trending on Dribbble.'
+"""
+
         message = HumanMessage(
             content=[
-                {"type": "text", "text": "Analyze this image for a T-shirt design. Extract the following specific details:"},
+                {"type": "text", "text": prompt_instruction},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                    "image_url": {"url": image_data_url},
                 },
             ]
         )
@@ -102,16 +115,17 @@ class CreativeAgent:
         class Concept(BaseModel):
             title: str = Field(description="Catchy title for the T-shirt design")
             visual_prompt: str = Field(description="Full prompt for AI image generator")
-            # Structured breakdown
-            subject: str = Field(description="The main character/subject")
-            action: str = Field(description="What the subject is doing")
-            context: str = Field(description="Environment or background elements")
-            art_style: str = Field(description="The specific art style used")
-            colors: str = Field(description="The color palette used")
-            
+            # Structured breakdown – each field is a list of 3 AI-suggested alternatives
+            subject: List[str] = Field(description="3 alternative main characters/subjects (the first one is the primary choice)")
+            action: List[str] = Field(description="3 alternative actions the subject could perform (the first one is the primary choice)")
+            context: List[str] = Field(description="3 alternative environments or background elements (the first one is the primary choice)")
+            mood: List[str] = Field(description="3 alternative emotional tones or vibes (the first one is the primary choice)")
+            art_style: List[str] = Field(description="3 alternative art styles (the first one is the primary choice)")
+            colors: List[str] = Field(description="3 alternative color palettes (the first one is the primary choice)")
+
             caption: str = Field(description="Text or slogan on the shirt")
             logic: str = Field(description="Business logic or why this design works")
-            focus: str = Field(description="The specific element that was changed, e.g., 'Subject', 'Action', 'Style', 'Context'")
+            focus: str = Field(description="The specific element that was changed, e.g., 'Subject', 'Action', 'Context', 'Mood', 'Style', 'Color'")
 
         class DesignConcepts(BaseModel):
             concepts: List[Concept]
@@ -131,24 +145,37 @@ class CreativeAgent:
         {keywords_context}
         
         Task:
-        Create 4 DISTINCT T-shirt design concepts based on the following specific strategies:
+        Create EXACTLY 6 DISTINCT T-shirt design concept groups based on these strategies.
         
-        1. **Concept 1: The Subject Twist**
-           - **CRITICAL**: Look at the "Action" identified in the image analysis.
-           - **KEEP THIS ACTION** exactly as is.
-           - **CHANGE THE SUBJECT** to a completely different character based on RAG keywords (e.g. Instead of Bigfoot holding a sausage, make it a T-Rex holding a sausage).
+        **CRITICAL RULE FOR ALL 6 CONCEPTS:**
+        Each concept has a single "focus" field that gets **3 creative variants**.
+        ALL OTHER FIELDS must contain **exactly 1 value each** (kept consistent within the group).
+        
+        1. **Concept 1: The Subject Twist** (focus = "Subject")
+           - Keep the original Action, Context, Mood, Art Style, Colors FIXED (1 value each).
+           - Provide EXACTLY 3 creative DIFFERENT subjects (e.g. ["T-Rex", "Corgi", "Grizzly Bear"]).
+           - Pick the strongest subject as the basis for the visual_prompt and title.
            
-        2. **Concept 2: The Action Switch**
-           - **CRITICAL**: Keep the **ORIGINAL SUBJECT**.
-           - **CHANGE THE ACTION** to something unexpected, funny, or trending (e.g. skateboarding, gaming, drinking boba).
+        2. **Concept 2: The Action Switch** (focus = "Action")
+           - Keep the original Subject, Context, Mood, Art Style, Colors FIXED (1 value each).
+           - Provide EXACTLY 3 creative DIFFERENT actions (e.g. ["skateboarding", "gaming", "drinking boba"]).
            
-        3. **Concept 3: The Visual Remix (Style + Color)**
-           - Keep the original subject and action.
-           - **CHANGE THE ART STYLE AND COLORS** together. Use a trending style (e.g. Kawaii, Vaporwave, Glitch Art) AND a matching unique color palette.
+        3. **Concept 3: The Context Shift** (focus = "Context")
+           - Keep the original Subject, Action, Mood, Art Style, Colors FIXED (1 value each).
+           - Provide EXACTLY 3 creative DIFFERENT contexts (e.g. ["Outer Space", "Cyberpunk City", "Medieval Tavern"]).
            
-        4. **Concept 4: The Context Shift**
-           - Keep the original subject and action.
-           - **CHANGE THE CONTEXT/BACKGROUND** to a completely different setting (e.g. Outer Space, Underwater, Cyberpunk City, Ancient Rome).
+        4. **Concept 4: The Mood Shift** (focus = "Mood")
+           - Keep the original Subject, Action, Context, Art Style, Colors FIXED (1 value each).
+           - Provide EXACTLY 3 creative DIFFERENT moods (e.g. ["epic & dramatic", "funny & playful", "dark & mysterious"]).
+
+        5. **Concept 5: The Style Remix** (focus = "Style")
+           - Keep the original Subject, Action, Context, Mood FIXED (1 value each).
+           - Keep the original Colors FIXED (1 value) — do NOT change the color palette.
+           - Provide EXACTLY 3 creative DIFFERENT art_style values (e.g. ["Kawaii", "Vaporwave", "Glitch Art"]).
+           
+        6. **Concept 6: The Color Shift** (focus = "Color")
+           - Keep the original Subject, Action, Context, Mood, Art Style ALL FIXED (1 value each).
+           - Provide EXACTLY 3 creative DIFFERENT color palettes (e.g. ["Neon Cyberpunk", "Pastel Watercolor", "Monochrome Black & White"]).
         """
         
         if user_instruction:
@@ -165,29 +192,159 @@ class CreativeAgent:
                - If the user asks to "change action to dancing", the new Action IS "dancing". **DO NOT** keep the old action.
                - If the user asks to "change subject to a cat", the new Subject IS "cat". **DO NOT** keep the old subject.
             3. Generate 3 VARIATIONS of this *refined* concept (e.g. 3 different ways to show the T-Rex dancing).
-            4. You can ignore the strict "Subject/Style/Color" split if it doesn't make sense for a refinement, BUT try to keep diversity in the details.
+            4. You can ignore the strict split if it doesn't make sense for a refinement, BUT try to keep diversity in the details.
             """
             
         prompt += """
         
         Output Format:
-        Return a JSON with 4 concepts.
+        Return a JSON with EXACTLY 6 concepts (one per strategy above).
         For each concept, provide:
-        - title: Catchy name
-        - visual_prompt: The full, detailed prompt for generation.
-        - subject: The specific subject (e.g. "T-Rex").
-        - action: The specific action (e.g. "holding a sausage").
-        - context: Background/Environment details.
-        - art_style: The art style used.
-        - colors: The color palette.
-        - caption: Text for the shirt.
-        - logic: Explain WHICH strategy you used (Subject Twist, Style Shift, or Color Pop) and why.
-        - focus: ONE word indicating the main change: "Subject", "Action", "Style", or "Context".
+        - title: Catchy name (based on the primary/first variant).
+        - visual_prompt: Full detailed prompt using the PRIMARY (first) value of each field.
+        - subject: LIST with EXACTLY 3 values if focus="Subject", else LIST with EXACTLY 1 value.
+        - action: LIST with EXACTLY 3 values if focus="Action", else LIST with EXACTLY 1 value.
+        - context: LIST with EXACTLY 3 values if focus="Context", else LIST with EXACTLY 1 value.
+        - mood: LIST with EXACTLY 3 values if focus="Mood", else LIST with EXACTLY 1 value.
+        - art_style: LIST with EXACTLY 3 values if focus="Style", else LIST with EXACTLY 1 value.
+        - colors: LIST with EXACTLY 3 values if focus="Color", else LIST with EXACTLY 1 value.
+        - caption: Shirt slogan text.
+        - logic: Explain the strategy used and why it works.
+        - focus: ONE word – "Subject", "Action", "Context", "Mood", "Style", or "Color".
         """
         
         structured_llm = self.creative_llm.with_structured_output(DesignConcepts)
         response = structured_llm.invoke([HumanMessage(content=prompt)])
         return response.concepts
+
+    def generate_mixed_subcards(self, concepts: list) -> list:
+        """
+        Second AI pass: given the 5 raw concept objects, the AI autonomously decides
+        which fields to combine from which group to create 9 interesting sub-cards
+        per group, and writes a creative visual_prompt for each combination.
+
+        Returns a list of 5 group dicts, each with 9 sub-card dicts.
+        """
+        from pydantic import BaseModel, Field
+        from typing import List, Dict
+
+        class SubCard(BaseModel):
+            sub_label: str = Field(description="Short label e.g. '1.1', '1.2', ..., '1.9'")
+            subject: str   = Field(description="Subject used in this sub-card")
+            action: str    = Field(description="Action used in this sub-card")
+            context: str   = Field(description="Context/setting used in this sub-card")
+            mood: str      = Field(description="Mood used in this sub-card")
+            art_style: str = Field(description="Art style used in this sub-card")
+            colors: str    = Field(description="Color palette used in this sub-card")
+            visual_prompt: str = Field(description="Full creative T-shirt visual_prompt built from the above fields")
+            mixed_fields: List[str] = Field(description="List of field names that were taken from a concept other than the primary group (e.g. ['action', 'mood'])")
+
+        class ConceptGroup(BaseModel):
+            focus: str           = Field(description="The primary focus of this group: Subject, Action, Style, Context, or Mood")
+            group_index: int     = Field(description="1-based index of this group (1-5)")
+            cross_label: str     = Field(description="Short label for the cross dimension e.g. 'Subject × Action'")
+            logic: str           = Field(description="One sentence explaining what this group explores")
+            sub_cards: List[SubCard] = Field(description="Exactly 9 sub-cards for this group")
+
+        class MixedGroups(BaseModel):
+            groups: List[ConceptGroup] = Field(description="Exactly 5 concept groups")
+
+        # Serialize the 5 concepts into a readable summary for the AI
+        concept_summaries = []
+        for c in concepts:
+            focus = c.get("focus", "?")
+            summary = f"- Group [{focus}]:"
+            for field in ["subject", "action", "context", "mood", "art_style", "colors"]:
+                val = c.get(field, [])
+                vals = val if isinstance(val, list) else [val]
+                summary += f"\n    {field}: {' | '.join(vals)}"
+            concept_summaries.append(summary)
+        concepts_text = "\n".join(concept_summaries)
+
+        prompt = f"""
+You are a Creative Director for a T-shirt POD business.
+
+Below are 5 concept groups generated for a T-shirt design.
+Each group has a "focus" field with 3 variants, and other fields with 1 value each.
+
+{concepts_text}
+
+TASK:
+For each of the 5 groups, create EXACTLY 9 sub-cards.
+Each sub-card must have all 6 fields: subject, action, context, mood, art_style, colors.
+
+MIXING RULES (follow intelligently – the goal is maximum creative diversity):
+- For the primary group's focus field: cycle through its 3 variants (each variant appears in 3 sub-cards).
+- For the other 5 fields: CREATIVELY mix values from OTHER groups wherever it improves diversity and aesthetics.
+  - You can fix 2-3 fields from the primary group, and swap 2-3 fields from other groups.
+  - Make sure each of the 9 sub-cards feels like a genuinely DIFFERENT and interesting T-shirt design.
+  - Avoid repeating the exact same combination twice.
+
+For EACH sub-card:
+1. Choose the field values (clearly state which group each field came from if it's NOT from the primary group).
+2. Write a CREATIVE, COHESIVE visual_prompt using all 6 chosen field values.
+   The prompt should flow naturally like: "A [art_style] T-shirt design of [subject] [action], set in [context].
+   The mood is [mood]. Color palette: [colors]. High detail, white background, print-on-demand ready."
+
+OUTPUT:
+Return a JSON with EXACTLY 5 groups.
+Each group has:
+- focus: name of the primary group (Subject/Action/Style/Context/Mood)
+- group_index: 1-5 in this fixed order: Subject=1, Action=2, Style=3, Context=4, Mood=5
+- cross_label: short string like "Subject × Action" describing what's mixed
+- logic: 1 sentence explaining the group's creative strategy
+- sub_cards: list of EXACTLY 9 sub-cards, labeled 1.1 through 1.9 (or 2.1-2.9, etc.)
+  Each sub_card: sub_label, subject, action, context, mood, art_style, colors, visual_prompt, mixed_fields
+"""
+
+        structured_llm = self.creative_llm.with_structured_output(MixedGroups)
+        response = structured_llm.invoke([HumanMessage(content=prompt)])
+
+        # Convert Pydantic objects to plain dicts
+        groups = []
+        for g in response.groups:
+            group_dict = g.model_dump()
+            groups.append(group_dict)
+        return groups
+
+    def refine_prompt_with_instruction(self, current_prompt: str, instruction: str, current_concept: dict = None) -> dict:
+        from pydantic import BaseModel, Field
+
+        class RefinedConcept(BaseModel):
+            visual_prompt: str = Field(description="The rewritten, highly detailed, flowing text-to-image prompt.")
+            subject: str = Field(description="Updated subject based on the instruction, or original if unchanged")
+            action: str = Field(description="Updated action based on the instruction, or original if unchanged")
+            context: str = Field(description="Updated context based on the instruction, or original if unchanged")
+            mood: str = Field(description="Updated mood based on the instruction, or original if unchanged")
+            art_style: str = Field(description="Updated art style based on the instruction, or original if unchanged")
+            colors: str = Field(description="Updated colors based on the instruction, or original if unchanged")
+
+        concept_context = ""
+        if current_concept:
+            concept_context = f"\nCURRENT FIELDS:\n"
+            for k, v in current_concept.items():
+                concept_context += f"- {k.capitalize()}: {v}\n"
+
+        prompt = f"""
+        You are an expert at writing highly detailed cohesive text-to-image prompts (for Midjourney/Dall-E).
+        
+        The user wants to refine an existing image generation concept based on a specific instruction.
+        
+        CURRENT PROMPT:
+        {current_prompt}
+        {concept_context}
+        
+        USER INSTRUCTION:
+        {instruction}
+        
+        Task:
+        1. Rewrite the CURRENT PROMPT to carefully incorporate the USER INSTRUCTION. Ensure the new prompt remains cohesive, highly detailed, and flowing.
+        2. Update the CURRENT FIELDS to reflect any changes caused by the user instruction. If a field is not affected by the instruction, keep its original value.
+        """
+        
+        structured_llm = self.creative_llm.with_structured_output(RefinedConcept)
+        response = structured_llm.invoke([HumanMessage(content=prompt)])
+        return response.model_dump()
 
     def run(self, image_path, user_instruction=None):
         # 1. Vision Analysis (Structured)
@@ -222,11 +379,12 @@ class CreativeAgent:
         class Concept(BaseModel):
             title: str = Field(description="Catchy title for the T-shirt design")
             visual_prompt: str = Field(description="Detailed prompt for AI image generator")
-            subject: str = Field(description="The specific subject")
-            action: str = Field(description="The specific action")
-            context: str = Field(description="Environment or background")
-            art_style: str = Field(description="The art style")
-            colors: str = Field(description="The color palette")
+            subject: List[str] = Field(description="3 alternative subjects (first is primary)")
+            action: List[str] = Field(description="3 alternative actions (first is primary)")
+            context: List[str] = Field(description="3 alternative environments (first is primary)")
+            mood: List[str] = Field(description="3 alternative moods (first is primary)")
+            art_style: List[str] = Field(description="3 alternative art styles (first is primary)")
+            colors: List[str] = Field(description="3 alternative color palettes (first is primary)")
             caption: str = Field(description="Text or slogan on the shirt")
             logic: str = Field(description="Why this variation works")
             focus: str = Field(description="The specific element that was changed")
@@ -263,6 +421,7 @@ class CreativeAgent:
         Subject: {original_concept.get('subject')}
         Action: {original_concept.get('action')}
         Context: {original_concept.get('context')}
+        Mood: {original_concept.get('mood')}
         Art Style: {original_concept.get('art_style')}
         Colors: {original_concept.get('colors')}
         Focus: {focus_area}
@@ -349,6 +508,69 @@ class CreativeAgent:
         except Exception as e:
             print(f"Error extracting keywords: {e}")
             return {"rag_text": rag_text, "keywords": []}
+
+    def suggest_matrix_criteria(self, vision_analysis_dict: dict) -> dict:
+        print("Suggesting Auto Matrix Criteria...")
+        from pydantic import BaseModel, Field
+        from typing import List
+
+        class MatrixCriteria(BaseModel):
+            subjects: List[str] = Field(description="5 highly creative alternative subjects/characters for the design")
+            actions: List[str] = Field(description="5 totally different, funny, or trending actions/poses")
+            moods: List[str] = Field(description="5 distinct emotional expressions or moods")
+
+        prompt = f"""
+        You are an expert Print-on-Demand Creative Director.
+        
+        We have analyzed a base image to extract its core attributes:
+        Base Analysis: {json.dumps(vision_analysis_dict)}
+        
+        We are preparing an "Auto Matrix" generation where we swap out the Subject, Action, and Mood, while keeping the original Art Style and Context.
+        
+        Task: 
+        Suggest exactly 5 creative, highly marketable alternative Subjects, 5 alternative Actions, and 5 alternative Moods that would fit perfectly within the original image's Art Style.
+        """
+
+        structured_llm = self.creative_llm.with_structured_output(MatrixCriteria)
+        response = structured_llm.invoke([HumanMessage(content=prompt)])
+        return response.model_dump()
+
+    def matrix_create_concept(self, vision_analysis_dict: dict, subject: str, action: str, mood: str) -> dict:
+        print(f"Creating Matrix Concept: Subject={subject}, Action={action}, Mood={mood}")
+        from pydantic import BaseModel, Field
+
+        class MatrixConcept(BaseModel):
+            title: str = Field(description="Catchy title for the T-shirt design")
+            visual_prompt: str = Field(description="Full prompt for AI image generator")
+            subject: str = Field(description="The main character/subject")
+            action: str = Field(description="What the subject is doing")
+            context: str = Field(description="Environment or background elements")
+            mood: str = Field(description="The emotional tone or vibe of the concept")
+            art_style: str = Field(description="The specific art style used")
+            colors: str = Field(description="The color palette used")
+            caption: str = Field(description="Text or slogan on the shirt")
+            logic: str = Field(description="Why this Matrix combination works")
+            focus: str = Field(description="Matrix Generation")
+
+        prompt = f"""
+        You are a Creative Director for a POD (Print on Demand) T-shirt business.
+        We are doing a "Matrix Generation" where we force-swap elements of a base image.
+        
+        BASE IMAGE ANALYSIS (Keep its Art Style, Colors, and Context):
+        {json.dumps(vision_analysis_dict)}
+        
+        NEW MANDATORY ELEMENTS TO USE:
+        - SUBJECT: {subject}
+        - ACTION/POSE: {action}
+        - MOOD/VIBE: {mood}
+        
+        Task:
+        Create a single, highly detailed cohesive text-to-image prompt (for Midjourney/Dall-E) that seamlessly combines the NEW SUBJECT, NEW ACTION, and NEW MOOD, but explicitly uses the Art Style, Lines, Coloring style, and Environment/Context from the BASE IMAGE ANALYSIS.
+        """
+        
+        structured_llm = self.creative_llm.with_structured_output(MatrixConcept)
+        response = structured_llm.invoke([HumanMessage(content=prompt)])
+        return response.model_dump()
 
 if __name__ == "__main__":
     # Test with a dummy image path or ask user
