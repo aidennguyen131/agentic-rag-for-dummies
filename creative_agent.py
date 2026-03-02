@@ -17,7 +17,7 @@ import csv
 import re
 import json
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict, Optional
 
 class CreativeAgent:
     def __init__(self):
@@ -27,7 +27,7 @@ class CreativeAgent:
         
         from langchain_google_genai import ChatGoogleGenerativeAI
         # Initialize Vision LLM (migrated to Gemini 3.0 Pro)
-        self.vision_llm = ChatGoogleGenerativeAI(model="gemini-3-pro-preview", max_tokens=2000)
+        self.vision_llm = ChatGoogleGenerativeAI(model="gemini-3-pro-preview", max_tokens=4000)
         self.creative_llm = ChatGoogleGenerativeAI(model="gemini-3-pro-preview", temperature=0.3)
 
     def encode_image(self, image_path):
@@ -53,14 +53,49 @@ class CreativeAgent:
             colors: str = Field(description="Dominant colors and palette description")
             mood: str = Field(description="The emotional tone (e.g. funny, scary, serious)")
             key_elements: List[str] = Field(description="List of other important visual elements")
+            composition: str = Field(default="", description="Composition breakdown: foreground, midground, background, focal point, and framing")
+            lighting: str = Field(default="", description="Lighting direction, intensity, contrast, and shadows/highlights")
+            camera_angle: str = Field(default="", description="Viewpoint and lens feeling (e.g. eye-level, low-angle, close-up, wide shot)")
+            linework: str = Field(default="", description="Line quality details: thickness, cleanliness, sketchiness, edge treatment")
+            texture_details: str = Field(default="", description="Surface/material textures and print-relevant details (grain, halftone, distress, brush marks)")
+            typography: str = Field(default="", description="Text treatment if present: wording area, font vibe, layout, readability")
+            negative_constraints: str = Field(default="", description="What should be avoided in generation to preserve style fidelity and print usability")
             visual_prompt: str = Field(description="A highly detailed cohesive text-to-image prompt")
 
         image_data_url = self.encode_image(image_path)
         
-        prompt_instruction = """Analyze this image for a T-shirt design. Provide the results in JSON format matching the schema.
-For the 'visual_prompt' field, create a highly detailed cohesive text-to-image prompt. 
-Example of desired format for visual_prompt:
-'A high-quality vector mascot art of a fierce brown bear dressed as a Japanese Samurai. The bear has an intense, angry expression and is wearing detailed black and red samurai armor with a traditional kabuto helmet featuring golden ornaments. The bear is wielding a sharp Katana sword in a dynamic pose. Behind the bear is a large solid red sun. In the foreground and background, there are cherry blossom branches with pink flowers and falling petals. Four black crows are flying around the scene. Clean bold outlines, flat colors with professional cel-shading, white background, symmetrical composition, 2D cartoon style, high contrast, trending on Dribbble.'
+        prompt_instruction = """Analyze this image for a POD T-shirt design and return JSON strictly matching the schema.
+
+Your analysis must be detailed, concrete, and production-oriented for print design.
+
+Requirements:
+1. SUBJECT/ACTION/CONTEXT/MOOD/STYLE/COLORS:
+   - Be specific, avoid vague labels.
+   - Preserve what is actually in the image (do not "clean up" rough art unless it is truly clean).
+2. KEY_ELEMENTS:
+   - List 6-12 important visual elements (objects, symbols, motifs, accessories, background items).
+3. COMPOSITION:
+   - Describe foreground/midground/background, focal point, subject scale, spacing, and framing.
+4. LIGHTING:
+   - Describe key light direction, contrast, shadows, highlights, color temperature.
+5. CAMERA_ANGLE:
+   - Describe perspective and shot type (eye-level/low-angle/top-down, close/medium/wide).
+6. LINEWORK:
+   - Describe line thickness, edge quality, sketchiness/cleanliness, contour behavior.
+7. TEXTURE_DETAILS:
+   - Describe textures and print-relevant effects (grain, halftone, noise, distress, brush strokes, ink bleed, gradients).
+8. TYPOGRAPHY:
+   - If text exists, describe placement, hierarchy, style, and readability; otherwise explicitly say "No visible typography".
+9. NEGATIVE_CONSTRAINTS:
+   - List what to avoid in generation (wrong style shifts, clutter, unreadable details, trademark/copyrighted characters, NSFW).
+10. VISUAL_PROMPT:
+   - Write one cohesive, high-detail, generation-ready prompt that faithfully preserves the original style and composition.
+   - Minimum length: 250 words. Target range: 250-350 words.
+   - Include explicit details for subject anatomy/pose, props, foreground/midground/background, lighting setup, texture treatment, line quality, palette behavior, and print composition.
+   - Include medium/style/texture/lighting/composition details and clear print-friendly constraints.
+   - Keep it safe and free of trademarked character names.
+
+Do not output markdown. Output only valid JSON.
 """
 
         message = HumanMessage(
@@ -107,7 +142,133 @@ Example of desired format for visual_prompt:
         final_message = result["messages"][-1]
         return final_message.content
 
-    def mix_and_create(self, description, rag_ideas, user_instruction=None, selected_keywords=None):
+    def _normalize_field_inputs(self, field_inputs: Optional[Dict[str, List[str]]]) -> Dict[str, List[str]]:
+        normalized = {k: [] for k in ["subject", "action", "mood", "style", "colors", "context"]}
+        if not isinstance(field_inputs, dict):
+            return normalized
+
+        for k in normalized.keys():
+            values = field_inputs.get(k, [])
+            if not isinstance(values, list):
+                continue
+            clean_vals = [str(v).strip() for v in values if str(v).strip()]
+            normalized[k] = clean_vals[:3]
+        return normalized
+
+    def _load_style_rows(self) -> List[dict]:
+        rows = []
+        csv_path = os.path.join(base_dir, "..", "ArtStyles_v2.csv")
+        try:
+            if not os.path.exists(csv_path):
+                return []
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get("Style"):
+                        rows.append(row)
+        except Exception as e:
+            print(f"Error loading styles CSV: {e}")
+        return rows
+
+    def suggest_field_inputs(
+        self,
+        vision_analysis: dict,
+        current_inputs: Optional[Dict[str, List[str]]] = None,
+        target_field: Optional[str] = None,
+        force_regenerate: bool = False
+    ) -> Dict[str, List[str]]:
+        from pydantic import BaseModel, Field
+
+        class SuggestedFields(BaseModel):
+            subject: List[str] = Field(default_factory=list)
+            action: List[str] = Field(default_factory=list)
+            mood: List[str] = Field(default_factory=list)
+            style: List[str] = Field(default_factory=list)
+            colors: List[str] = Field(default_factory=list)
+            context: List[str] = Field(default_factory=list)
+
+        normalized = self._normalize_field_inputs(current_inputs)
+        styles = self._load_style_rows()
+        style_names = [row.get("Style", "").strip() for row in styles if row.get("Style", "").strip()]
+        style_categories = [row.get("Category", "").strip() for row in styles if row.get("Category", "").strip()]
+        style_usages = [row.get("Usage", "").strip() for row in styles if row.get("Usage", "").strip()]
+
+        topic_keywords = self.get_preset_keywords()
+        valid_target = target_field if target_field in normalized else ""
+
+        prompt = f"""
+You are a POD concept input assistant.
+
+Goal:
+- Return suggestions for 6 fields: subject, action, mood, style, colors, context.
+- Each field can contain 1 to 3 values.
+- Keep suggestions coherent (avoid contradictions like mood=dark while colors=pastel cute unless intentionally stylistic).
+
+Rules:
+- If force_regenerate is FALSE:
+  - Keep existing values and top up suggestions to reach up to 3 values per field.
+  - Do NOT overwrite existing values unless force_regenerate is TRUE.
+- If force_regenerate is TRUE:
+  - If target_field is set, regenerate ONLY that field and keep all others unchanged.
+  - If target_field is empty, regenerate all fields.
+- Maximum 3 values per field.
+- Prefer using these data sources:
+  1) Topic keywords from 50Topics_Keyword.csv
+  2) Styles metadata from ArtStyles_v2.csv
+
+Current field inputs:
+{json.dumps(normalized, ensure_ascii=False)}
+
+Target field:
+{valid_target or "all"}
+
+force_regenerate:
+{str(force_regenerate).lower()}
+
+Vision analysis:
+{json.dumps(vision_analysis or {}, ensure_ascii=False)}
+
+Data source snippets:
+- Topic keywords sample: {json.dumps(topic_keywords[:120], ensure_ascii=False)}
+- Style names sample: {json.dumps(style_names[:180], ensure_ascii=False)}
+- Style categories sample: {json.dumps(style_categories[:120], ensure_ascii=False)}
+- Style usages sample: {json.dumps(style_usages[:120], ensure_ascii=False)}
+
+Output:
+- Return JSON only for fields: subject, action, mood, style, colors, context.
+- Each field must be a list with up to 3 concise values.
+"""
+
+        structured_llm = self.creative_llm.with_structured_output(SuggestedFields)
+        response = structured_llm.invoke([HumanMessage(content=prompt)])
+        suggested = response.model_dump()
+
+        result = {}
+        for field in normalized.keys():
+            old_vals = normalized[field]
+            new_vals = [str(v).strip() for v in suggested.get(field, []) if str(v).strip()][:3]
+
+            if not force_regenerate:
+                # Preserve user/current values first, then append unique AI suggestions.
+                merged = list(old_vals)
+                seen = {v.lower() for v in merged}
+                for candidate in new_vals:
+                    key = candidate.lower()
+                    if key in seen:
+                        continue
+                    merged.append(candidate)
+                    seen.add(key)
+                    if len(merged) >= 3:
+                        break
+                result[field] = merged[:3]
+            else:
+                if valid_target:
+                    result[field] = new_vals if field == valid_target else old_vals
+                else:
+                    result[field] = new_vals
+        return result
+
+    def mix_and_create(self, description, rag_ideas, user_instruction=None, selected_keywords=None, field_inputs=None):
         print("Mixing ideas...")
         from pydantic import BaseModel, Field
         from typing import List
@@ -130,6 +291,27 @@ Example of desired format for visual_prompt:
         class DesignConcepts(BaseModel):
             concepts: List[Concept]
 
+        normalized_fields = self._normalize_field_inputs(field_inputs)
+        field_context = ""
+        if any(len(v) > 0 for v in normalized_fields.values()):
+            field_context = f"""
+
+**MANDATORY USER FIELD INPUTS**:
+User-provided fields (each can have 1-3 values):
+- Subject: {normalized_fields['subject']}
+- Action: {normalized_fields['action']}
+- Mood: {normalized_fields['mood']}
+- Style: {normalized_fields['style']}
+- Colors: {normalized_fields['colors']}
+- Context: {normalized_fields['context']}
+
+Use these as hard constraints:
+- If a field has values, you MUST prioritize them.
+- When a concept's focus field needs 3 variants, use user values first, then extend creatively if fewer than 3.
+- Keep cross-field coherence; avoid contradictory mood/style/color combinations unless explicitly implied by user input.
+- If Subject has user-provided values, treat them as the source of truth and DO NOT revert to the original image subject unless that original subject is explicitly included by the user.
+"""
+
         keywords_context = ""
         if selected_keywords and len(selected_keywords) > 0:
             keywords_context = f"\n\n**MANDATORY USER SELECTED KEYWORDS/NICHES**:\nThe user has explicitly selected these keywords to focus on: {', '.join(selected_keywords)}.\nENSURE these keywords are heavily integrated into the concepts (either as subjects, themes, or puns)."
@@ -142,6 +324,7 @@ Example of desired format for visual_prompt:
         
         Inspiration from our Database (Trending Keywords/Styles):
         {rag_ideas}
+        {field_context}
         {keywords_context}
         
         Task:
@@ -217,7 +400,214 @@ Example of desired format for visual_prompt:
         response = structured_llm.invoke([HumanMessage(content=prompt)])
         return response.concepts
 
-    def generate_mixed_subcards(self, concepts: list) -> list:
+    def _extract_baseline_fields(self, description, vision_analysis: Optional[Dict], normalized_fields: Dict[str, List[str]]) -> Dict[str, str]:
+        baseline = {
+            "subject": "",
+            "action": "",
+            "context": "",
+            "mood": "",
+            "art_style": "",
+            "colors": "",
+        }
+
+        source = vision_analysis if isinstance(vision_analysis, dict) else {}
+        if not source and isinstance(description, str):
+            try:
+                parsed = json.loads(description)
+                if isinstance(parsed, dict):
+                    source = parsed
+            except Exception:
+                source = {}
+
+        key_map = {
+            "subject": "subject",
+            "action": "action",
+            "context": "context",
+            "mood": "mood",
+            "art_style": "art_style",
+            "colors": "colors",
+        }
+        for out_key, src_key in key_map.items():
+            baseline[out_key] = str(source.get(src_key, "")).strip()
+
+        user_override_map = {
+            "subject": "subject",
+            "action": "action",
+            "context": "context",
+            "mood": "mood",
+            "art_style": "style",
+            "colors": "colors",
+        }
+        for out_key, field_key in user_override_map.items():
+            vals = normalized_fields.get(field_key, [])
+            if vals:
+                baseline[out_key] = str(vals[0]).strip()
+
+        return baseline
+
+    def _coerce_concept_shape(self, concept: Dict, focus_name: str, baseline: Dict[str, str]) -> Dict:
+        focus_to_field = {
+            "Subject": "subject",
+            "Action": "action",
+            "Context": "context",
+            "Mood": "mood",
+            "Style": "art_style",
+            "Color": "colors",
+        }
+        focused_field = focus_to_field.get(focus_name, "subject")
+        concept["focus"] = focus_name
+
+        for field in ["subject", "action", "context", "mood", "art_style", "colors"]:
+            val = concept.get(field, [])
+            if not isinstance(val, list):
+                val = [str(val).strip()] if str(val).strip() else []
+            else:
+                val = [str(v).strip() for v in val if str(v).strip()]
+
+            if field == focused_field:
+                if not val:
+                    fallback = baseline.get(field, "") or "Creative variation"
+                    val = [fallback]
+                while len(val) < 3:
+                    val.append(val[-1])
+                concept[field] = val[:3]
+            else:
+                if not val:
+                    fallback = baseline.get(field, "") or "Keep baseline"
+                    val = [fallback]
+                concept[field] = [val[0]]
+
+        concept["title"] = str(concept.get("title", "")).strip() or f"{focus_name} Concept"
+        concept["caption"] = str(concept.get("caption", "")).strip() or ""
+        concept["logic"] = str(concept.get("logic", "")).strip() or f"Explores {focus_name.lower()} variations while preserving coherence."
+
+        if not str(concept.get("visual_prompt", "")).strip():
+            concept["visual_prompt"] = (
+                f"{concept['art_style'][0]} T-shirt design featuring {concept['subject'][0]} "
+                f"{concept['action'][0]} in {concept['context'][0]}, mood {concept['mood'][0]}, "
+                f"colors {concept['colors'][0]}, clean white background, POD ready."
+            )
+        else:
+            concept["visual_prompt"] = str(concept["visual_prompt"]).strip()
+
+        return concept
+
+    def iter_concepts(
+        self,
+        description: str,
+        rag_ideas: str,
+        user_instruction: Optional[str] = None,
+        selected_keywords: Optional[List[str]] = None,
+        field_inputs: Optional[Dict[str, List[str]]] = None,
+        vision_analysis: Optional[Dict] = None,
+    ):
+        from pydantic import BaseModel, Field
+
+        class Concept(BaseModel):
+            title: str = Field(description="Catchy title for the T-shirt design")
+            visual_prompt: str = Field(description="Full prompt for AI image generator")
+            subject: List[str] = Field(description="Subject values")
+            action: List[str] = Field(description="Action values")
+            context: List[str] = Field(description="Context values")
+            mood: List[str] = Field(description="Mood values")
+            art_style: List[str] = Field(description="Art style values")
+            colors: List[str] = Field(description="Color palette values")
+            caption: str = Field(description="Text or slogan on the shirt")
+            logic: str = Field(description="Business logic or why this design works")
+            focus: str = Field(description="Focus field name")
+
+        class SingleConcept(BaseModel):
+            concept: Concept
+
+        normalized_fields = self._normalize_field_inputs(field_inputs)
+        baseline = self._extract_baseline_fields(description, vision_analysis, normalized_fields)
+
+        field_context = ""
+        if any(len(v) > 0 for v in normalized_fields.values()):
+            field_context = f"""
+
+User provided field values (prioritize these):
+- Subject: {normalized_fields['subject']}
+- Action: {normalized_fields['action']}
+- Mood: {normalized_fields['mood']}
+- Style: {normalized_fields['style']}
+- Colors: {normalized_fields['colors']}
+- Context: {normalized_fields['context']}
+"""
+
+        keywords_context = ""
+        if selected_keywords and len(selected_keywords) > 0:
+            keywords_context = f"\nUser-selected keywords to integrate strongly: {', '.join(selected_keywords)}."
+
+        focus_specs = [
+            ("Subject", "subject"),
+            ("Action", "action"),
+            ("Context", "context"),
+            ("Mood", "mood"),
+            ("Style", "art_style"),
+            ("Color", "colors"),
+        ]
+
+        structured_llm = self.creative_llm.with_structured_output(SingleConcept)
+
+        for focus_name, focus_key in focus_specs:
+            prompt = f"""
+You are a Creative Director for POD T-shirt concepts.
+
+Original image analysis:
+{description}
+
+RAG inspiration:
+{rag_ideas}
+{field_context}
+{keywords_context}
+
+Generate EXACTLY ONE concept focused on "{focus_name}".
+
+BASELINE LOCKED VALUES:
+- subject: {baseline['subject']}
+- action: {baseline['action']}
+- context: {baseline['context']}
+- mood: {baseline['mood']}
+- art_style: {baseline['art_style']}
+- colors: {baseline['colors']}
+
+Rules:
+- Focus field is "{focus_key}".
+- For focus field: return EXACTLY 3 distinct values.
+- For all other fields: return EXACTLY 1 value each.
+- Keep non-focus fields aligned to baseline/user constraints.
+- The title and visual_prompt must use the first value of each field.
+- visual_prompt must be detailed and print-on-demand ready.
+- focus must be exactly "{focus_name}".
+"""
+            if user_instruction:
+                prompt += f'\nUser instruction to honor: "{user_instruction}"\n'
+
+            prompt += """
+Output JSON object:
+{
+  "concept": {
+    "title": "...",
+    "visual_prompt": "...",
+    "subject": [...],
+    "action": [...],
+    "context": [...],
+    "mood": [...],
+    "art_style": [...],
+    "colors": [...],
+    "caption": "...",
+    "logic": "...",
+    "focus": "..."
+  }
+}
+"""
+            response = structured_llm.invoke([HumanMessage(content=prompt)])
+            concept_dict = response.concept.model_dump()
+            concept_dict = self._coerce_concept_shape(concept_dict, focus_name, baseline)
+            yield concept_dict
+
+    def generate_mixed_subcards(self, concepts: list, vision_analysis: dict = None, strict_subject_swap: bool = False) -> list:
         """
         Second AI pass: given the 5 raw concept objects, the AI autonomously decides
         which fields to combine from which group to create 9 interesting sub-cards
@@ -261,6 +651,35 @@ Example of desired format for visual_prompt:
             concept_summaries.append(summary)
         concepts_text = "\n".join(concept_summaries)
 
+        vision_analysis = vision_analysis or {}
+        vision_context_lines = []
+        if vision_analysis:
+            visual_prompt = str(vision_analysis.get("visual_prompt", "")).strip()
+            if visual_prompt:
+                vision_context_lines.append(f"- Baseline visual prompt: {visual_prompt}")
+            key_elements = vision_analysis.get("key_elements", [])
+            if isinstance(key_elements, list) and key_elements:
+                vision_context_lines.append(f"- Key visual anchors: {', '.join([str(v).strip() for v in key_elements if str(v).strip()])}")
+            for key, label in [
+                ("composition", "Composition"),
+                ("lighting", "Lighting"),
+                ("camera_angle", "Camera angle"),
+                ("linework", "Linework"),
+                ("texture_details", "Texture details"),
+                ("negative_constraints", "Negative constraints"),
+            ]:
+                val = str(vision_analysis.get(key, "")).strip()
+                if val:
+                    vision_context_lines.append(f"- {label}: {val}")
+
+        vision_context = "\n".join(vision_context_lines) if vision_context_lines else "- No additional baseline detail."
+        strict_subject_rule = """
+- STRICT SUBJECT SWAP MODE IS ON:
+  - For group_index=1 (Subject group), ONLY the subject may vary.
+  - Action, context, mood, art_style, and colors must stay exactly the same as the primary Subject group base values.
+  - Do not mix non-subject fields for Subject sub-cards.
+""" if strict_subject_swap else ""
+
         prompt = f"""
 You are a Creative Director for a T-shirt POD business.
 
@@ -279,12 +698,18 @@ MIXING RULES (follow intelligently – the goal is maximum creative diversity):
   - You can fix 2-3 fields from the primary group, and swap 2-3 fields from other groups.
   - Make sure each of the 9 sub-cards feels like a genuinely DIFFERENT and interesting T-shirt design.
   - Avoid repeating the exact same combination twice.
+{strict_subject_rule}
+
+BASELINE DETAIL CONTEXT (preserve quality/style cues when relevant):
+{vision_context}
 
 For EACH sub-card:
 1. Choose the field values (clearly state which group each field came from if it's NOT from the primary group).
 2. Write a CREATIVE, COHESIVE visual_prompt using all 6 chosen field values.
-   The prompt should flow naturally like: "A [art_style] T-shirt design of [subject] [action], set in [context].
-   The mood is [mood]. Color palette: [colors]. High detail, white background, print-on-demand ready."
+   The prompt should flow naturally and be detailed enough for high-fidelity generation.
+   - Include composition, lighting, texture/material hints, and print constraints if available from baseline context.
+   - Target depth: around 90-160 words (not a short one-liner).
+   - Ensure white/clean background and print-on-demand readiness.
 
 OUTPUT:
 Return a JSON with EXACTLY 5 groups.
@@ -477,10 +902,14 @@ Each group has:
             print(f"Error reading preset keywords: {e}")
             return []
             
-        # Shuffle and return a subset (e.g. 10) to add variety
-        import random
-        random.shuffle(keywords)
-        return keywords[:10]
+        # Preserve order and deduplicate while returning full set for downstream suggestion logic.
+        deduped = []
+        seen = set()
+        for kw in keywords:
+            if kw not in seen:
+                deduped.append(kw)
+                seen.add(kw)
+        return deduped
 
     def get_viral_keywords(self, vision_analysis_str):
         """Uses RAG to find viral keywords and returns them as a structured list."""
