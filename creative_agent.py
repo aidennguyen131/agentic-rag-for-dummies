@@ -155,6 +155,63 @@ Do not output markdown. Output only valid JSON.
             normalized[k] = clean_vals[:3]
         return normalized
 
+    def _subject_identity_key(self, value: str) -> str:
+        tokens = re.findall(r"[a-z0-9]+", str(value or "").lower())
+        if not tokens:
+            return ""
+
+        stop_tokens = {
+            "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "with", "from",
+            "anthropomorphic", "cute", "funny", "happy", "sad", "retro", "vintage", "fluffy", "tiny",
+            "big", "small", "brown", "black", "white", "red", "blue", "green", "yellow", "pink",
+            "wearing", "holding", "with", "oversized", "winter", "summer", "ski", "snow", "gear",
+            "goggles", "jacket", "coat", "hat", "scarf", "hoodie", "puffer", "outfit", "costume",
+            "style", "look", "vibe", "character"
+        }
+
+        for token in reversed(tokens):
+            if token in stop_tokens:
+                continue
+            if token.isdigit():
+                continue
+            return token
+
+        return tokens[-1]
+
+    def _dedupe_subject_candidates(self, candidates: List[str], existing: Optional[List[str]] = None, limit: int = 3) -> List[str]:
+        result: List[str] = []
+        seen_text = set()
+        seen_identity = set()
+
+        for value in existing or []:
+            text_key = str(value).strip().lower()
+            if not text_key:
+                continue
+            seen_text.add(text_key)
+            ident = self._subject_identity_key(value)
+            if ident:
+                seen_identity.add(ident)
+
+        for value in candidates:
+            v = str(value).strip()
+            if not v:
+                continue
+            text_key = v.lower()
+            if text_key in seen_text:
+                continue
+            ident = self._subject_identity_key(v)
+            if ident and ident in seen_identity:
+                continue
+
+            result.append(v)
+            seen_text.add(text_key)
+            if ident:
+                seen_identity.add(ident)
+            if len(result) >= limit:
+                break
+
+        return result
+
     def _load_style_rows(self) -> List[dict]:
         rows = []
         csv_path = os.path.join(base_dir, "..", "ArtStyles_v2.csv")
@@ -215,6 +272,10 @@ Rules:
 - Prefer using these data sources:
   1) Topic keywords from 50Topics_Keyword.csv
   2) Styles metadata from ArtStyles_v2.csv
+- SUBJECT-SPECIFIC DIVERSITY RULE:
+  - Subject suggestions must be different character identities (different species/archetypes/professions), not outfit/accessory variants of the same character.
+  - Bad: "brown sloth", "sloth with goggles", "sloth in jacket".
+  - Good: "red panda snowboarder", "retro robot courier", "samurai frog drummer".
 
 Current field inputs:
 {json.dumps(normalized, ensure_ascii=False)}
@@ -247,23 +308,36 @@ Output:
         for field in normalized.keys():
             old_vals = normalized[field]
             new_vals = [str(v).strip() for v in suggested.get(field, []) if str(v).strip()][:3]
+            if field == "subject":
+                new_vals = self._dedupe_subject_candidates(
+                    new_vals,
+                    existing=old_vals if not force_regenerate else None,
+                    limit=3,
+                )
 
             if not force_regenerate:
                 # Preserve user/current values first, then append unique AI suggestions.
                 merged = list(old_vals)
-                seen = {v.lower() for v in merged}
-                for candidate in new_vals:
-                    key = candidate.lower()
-                    if key in seen:
-                        continue
-                    merged.append(candidate)
-                    seen.add(key)
-                    if len(merged) >= 3:
-                        break
+                if field == "subject":
+                    appended = self._dedupe_subject_candidates(new_vals, existing=merged, limit=max(0, 3 - len(merged)))
+                    merged.extend(appended)
+                else:
+                    seen = {v.lower() for v in merged}
+                    for candidate in new_vals:
+                        key = candidate.lower()
+                        if key in seen:
+                            continue
+                        merged.append(candidate)
+                        seen.add(key)
+                        if len(merged) >= 3:
+                            break
                 result[field] = merged[:3]
             else:
                 if valid_target:
-                    result[field] = new_vals if field == valid_target else old_vals
+                    if field == valid_target:
+                        result[field] = new_vals
+                    else:
+                        result[field] = old_vals
                 else:
                     result[field] = new_vals
         return result
