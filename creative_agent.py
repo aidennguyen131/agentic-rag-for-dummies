@@ -1,6 +1,7 @@
 import sys
 import os
 import base64
+import io
 from pathlib import Path
 
 # Add project directory to path
@@ -84,8 +85,56 @@ class CreativeAgent:
         mime_type, _ = mimetypes.guess_type(image_path)
         if not mime_type:
             mime_type = "image/jpeg"
+
+        # Resize/compress before sending to vision model to reduce payload latency.
+        try:
+            from PIL import Image, ImageOps
+
+            max_dim = int(os.getenv("VISION_MAX_DIM", "1536"))
+            jpeg_quality = int(os.getenv("VISION_JPEG_QUALITY", "85"))
+
+            with Image.open(image_path) as img:
+                img = ImageOps.exif_transpose(img)
+                original_size = img.size
+
+                if max(original_size) > max_dim:
+                    resampling = getattr(Image, "Resampling", Image).LANCZOS
+                    img.thumbnail((max_dim, max_dim), resampling)
+
+                has_alpha = (
+                    img.mode in ("RGBA", "LA")
+                    or (img.mode == "P" and "transparency" in img.info)
+                )
+
+                output = io.BytesIO()
+                if has_alpha:
+                    if img.mode not in ("RGBA", "LA"):
+                        img = img.convert("RGBA")
+                    img.save(output, format="PNG", optimize=True)
+                    out_mime = "image/png"
+                else:
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    img.save(
+                        output,
+                        format="JPEG",
+                        quality=jpeg_quality,
+                        optimize=True,
+                        progressive=True,
+                    )
+                    out_mime = "image/jpeg"
+
+                encoded = base64.b64encode(output.getvalue()).decode("utf-8")
+                print(
+                    f"Vision image preprocessed: {original_size} -> {img.size}, "
+                    f"mime={out_mime}, quality={jpeg_quality if out_mime == 'image/jpeg' else 'lossless'}"
+                )
+                return f"data:{out_mime};base64,{encoded}"
+        except Exception as e:
+            print(f"Vision preprocess skipped, using original file bytes: {e}")
+
         with open(image_path, "rb") as image_file:
-            b64 = base64.b64encode(image_file.read()).decode('utf-8')
+            b64 = base64.b64encode(image_file.read()).decode("utf-8")
             return f"data:{mime_type};base64,{b64}"
 
     def analyze_image(self, image_path):
