@@ -24,11 +24,60 @@ class CreativeAgent:
         print("Initializing Creative Agent...")
         self.rag = RAGSystem()
         self.rag.initialize()
-        
+
         from langchain_google_genai import ChatGoogleGenerativeAI
-        # Initialize Vision LLM (migrated to Gemini 3.0 Pro)
-        self.vision_llm = ChatGoogleGenerativeAI(model="gemini-3-pro-preview", max_tokens=4000)
-        self.creative_llm = ChatGoogleGenerativeAI(model="gemini-3-pro-preview", temperature=0.3)
+        self.default_vision_model = "gemini-3-pro-preview"
+        self.default_concept_model = "gemini-3-pro-preview"
+        self._creative_model_aliases = {
+            "gemini-3-pro-preview": "gemini-3-pro-preview",
+            "gemini 3 pro preview": "gemini-3-pro-preview",
+            "gemini-3-flash-preview": "gemini-3-flash-preview",
+            "gemini-3-flash": "gemini-3-flash-preview",
+            "gemini 3 flash": "gemini-3-flash-preview",
+            "gpt-5.2": "gpt-5.2",
+            "gpt 5.2": "gpt-5.2",
+            "gpt-5-mini": "gpt-5-mini",
+            "gpt 5 mini": "gpt-5-mini",
+        }
+        self._allowed_concept_models = {
+            "gemini-3-pro-preview",
+            "gemini-3-flash-preview",
+            "gpt-5.2",
+            "gpt-5-mini",
+        }
+        self._creative_llm_cache = {}
+
+        # Vision analysis remains fixed on Gemini Pro.
+        self.vision_llm = ChatGoogleGenerativeAI(model=self.default_vision_model, max_tokens=4000)
+        self.creative_llm, _ = self._get_creative_llm(self.default_concept_model)
+
+    def _normalize_concept_model(self, concept_model: Optional[str]) -> str:
+        raw = str(concept_model or "").strip()
+        if not raw:
+            return self.default_concept_model
+        canonical = self._creative_model_aliases.get(raw.lower(), raw)
+        if canonical not in self._allowed_concept_models:
+            allowed = ", ".join(sorted(self._allowed_concept_models))
+            raise ValueError(f"Unsupported concept model '{raw}'. Allowed: {allowed}")
+        return canonical
+
+    def _get_creative_llm(self, concept_model: Optional[str] = None):
+        model_name = self._normalize_concept_model(concept_model)
+        if model_name in self._creative_llm_cache:
+            return self._creative_llm_cache[model_name], model_name
+
+        if model_name.startswith("gemini-"):
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.3)
+        elif model_name.startswith("gpt-"):
+            if not os.getenv("OPENAI_API_KEY"):
+                raise ValueError("OPENAI_API_KEY is required for GPT concept models.")
+            llm = ChatOpenAI(model=model_name, temperature=0.3)
+        else:
+            raise ValueError(f"Cannot resolve provider for concept model '{model_name}'.")
+
+        self._creative_llm_cache[model_name] = llm
+        return llm, model_name
 
     def encode_image(self, image_path):
         import mimetypes
@@ -155,6 +204,99 @@ Do not output markdown. Output only valid JSON.
             normalized[k] = clean_vals[:3]
         return normalized
 
+    def _classify_fields(
+        self,
+        normalized_fields: Dict[str, List[str]],
+        vision_analysis: Optional[Dict],
+    ) -> tuple:
+        """Compare user field inputs vs vision baseline.
+        Returns (changed: dict[field->list[str]], locked: dict[field->str]).
+
+        A field is 'changed' ONLY if the user provided >1 value for it,
+        meaning they explicitly want VARIATION in that dimension.
+        A field with 0 or 1 value is 'locked' (baseline or user override).
+        """
+        source = vision_analysis if isinstance(vision_analysis, dict) else {}
+        baseline_map = {
+            "subject": "subject",
+            "action": "action",
+            "mood": "mood",
+            "style": "art_style",
+            "colors": "colors",
+            "context": "context",
+        }
+        changed: Dict[str, List[str]] = {}
+        locked: Dict[str, str] = {}
+
+        for field in ["subject", "action", "mood", "style", "colors", "context"]:
+            user_vals = normalized_fields.get(field, [])
+            baseline_key = baseline_map.get(field, field)
+            baseline_val = str(source.get(baseline_key, "")).strip()
+
+            if len(user_vals) > 1:
+                # Multiple values → user wants variation in this field
+                changed[field] = user_vals
+            else:
+                # 0 or 1 value → locked (use user's value or fall back to baseline)
+                locked[field] = user_vals[0].strip() if user_vals else baseline_val
+
+        return changed, locked
+
+    def _build_smart_combos(
+        self,
+        changed: Dict[str, List[str]],
+        locked: Dict[str, str],
+    ) -> tuple:
+        """Build Cartesian-product combos from changed fields, grouped by
+        the primary changed field (the one with the most values).
+
+        Returns (groups: list[dict], primary_field: str, total_cards: int).
+        Each group dict: { 'group_value': str, 'combos': list[dict] }
+        Each combo dict has all 6 fields with concrete single values.
+        No cap — all combos are generated.
+        """
+        import itertools
+
+        if not changed:
+            return [], "", 0
+
+        # Determine primary field (most values → used for grouping)
+        primary_field = max(changed, key=lambda f: len(changed[f]))
+
+        # Build ordered list of (field_name, values_list)
+        field_order = []
+        for f in ["subject", "action", "mood", "style", "colors", "context"]:
+            if f in changed:
+                field_order.append((f, changed[f]))
+
+        # Cartesian product — generate ALL combos
+        all_combos = list(itertools.product(*[vals for _, vals in field_order]))
+
+        # Convert tuples to full field dicts
+        combo_dicts = []
+        for combo_tuple in all_combos:
+            d = dict(locked)  # start with locked fields
+            for i, (field_name, _) in enumerate(field_order):
+                d[field_name] = combo_tuple[i]
+            combo_dicts.append(d)
+
+        # Group by primary field
+        from collections import OrderedDict
+        groups_map = OrderedDict()
+        for cd in combo_dicts:
+            key = cd[primary_field]
+            if key not in groups_map:
+                groups_map[key] = []
+            groups_map[key].append(cd)
+
+        groups = [
+            {"group_value": gv, "combos": combos}
+            for gv, combos in groups_map.items()
+        ]
+
+        total_cards = sum(len(g["combos"]) for g in groups)
+        return groups, primary_field, total_cards
+
     def _subject_identity_key(self, value: str) -> str:
         tokens = re.findall(r"[a-z0-9]+", str(value or "").lower())
         if not tokens:
@@ -262,12 +404,13 @@ Goal:
 - Keep suggestions coherent (avoid contradictions like mood=dark while colors=pastel cute unless intentionally stylistic).
 
 Rules:
-- If force_regenerate is FALSE:
-  - Keep existing values and top up suggestions to reach up to 3 values per field.
-  - Do NOT overwrite existing values unless force_regenerate is TRUE.
-- If force_regenerate is TRUE:
-  - If target_field is set, regenerate ONLY that field and keep all others unchanged.
-  - If target_field is empty, regenerate all fields.
+- If target_field is set:
+  - Operate ONLY on that field and keep all other fields unchanged.
+  - If force_regenerate is FALSE: keep existing values for target field, then top up to max 3.
+  - If force_regenerate is TRUE: regenerate target field values from scratch.
+- If target_field is empty:
+  - If force_regenerate is FALSE: keep existing values and top up to max 3 for all fields.
+  - If force_regenerate is TRUE: regenerate all fields from scratch.
 - Maximum 3 values per field.
 - Prefer using these data sources:
   1) Topic keywords from 50Topics_Keyword.csv
@@ -276,6 +419,7 @@ Rules:
   - Subject suggestions must be different character identities (different species/archetypes/professions), not outfit/accessory variants of the same character.
   - Bad: "brown sloth", "sloth with goggles", "sloth in jacket".
   - Good: "red panda snowboarder", "retro robot courier", "samurai frog drummer".
+- Do not copy Vision analysis values verbatim as suggestions. Prefer alternatives or paraphrased variants.
 
 Current field inputs:
 {json.dumps(normalized, ensure_ascii=False)}
@@ -304,16 +448,40 @@ Output:
         response = structured_llm.invoke([HumanMessage(content=prompt)])
         suggested = response.model_dump()
 
+        vision_key_map = {
+            "subject": "subject",
+            "action": "action",
+            "mood": "mood",
+            "style": "art_style",
+            "colors": "colors",
+            "context": "context",
+        }
+
+        def _filter_verbatim_vision(field: str, values: List[str]) -> List[str]:
+            if not values:
+                return values
+            vision_key = vision_key_map.get(field, field)
+            vision_value = str((vision_analysis or {}).get(vision_key, "")).strip().lower()
+            if not vision_value:
+                return values
+            filtered = [v for v in values if str(v).strip().lower() != vision_value]
+            return filtered or values
+
         result = {}
         for field in normalized.keys():
             old_vals = normalized[field]
             new_vals = [str(v).strip() for v in suggested.get(field, []) if str(v).strip()][:3]
+            new_vals = _filter_verbatim_vision(field, new_vals)
             if field == "subject":
                 new_vals = self._dedupe_subject_candidates(
                     new_vals,
                     existing=old_vals if not force_regenerate else None,
                     limit=3,
                 )
+
+            if valid_target and field != valid_target:
+                result[field] = old_vals
+                continue
 
             if not force_regenerate:
                 # Preserve user/current values first, then append unique AI suggestions.
@@ -333,16 +501,10 @@ Output:
                             break
                 result[field] = merged[:3]
             else:
-                if valid_target:
-                    if field == valid_target:
-                        result[field] = new_vals
-                    else:
-                        result[field] = old_vals
-                else:
-                    result[field] = new_vals
+                result[field] = new_vals
         return result
 
-    def mix_and_create(self, description, rag_ideas, user_instruction=None, selected_keywords=None, field_inputs=None):
+    def mix_and_create(self, description, rag_ideas, user_instruction=None, selected_keywords=None, field_inputs=None, concept_model: Optional[str] = None):
         print("Mixing ideas...")
         from pydantic import BaseModel, Field
         from typing import List
@@ -470,7 +632,9 @@ Use these as hard constraints:
         - focus: ONE word – "Subject", "Action", "Context", "Mood", "Style", or "Color".
         """
         
-        structured_llm = self.creative_llm.with_structured_output(DesignConcepts)
+        creative_llm, resolved_model = self._get_creative_llm(concept_model)
+        print(f"Concept generation model: {resolved_model}")
+        structured_llm = creative_llm.with_structured_output(DesignConcepts)
         response = structured_llm.invoke([HumanMessage(content=prompt)])
         return response.concepts
 
@@ -574,6 +738,7 @@ Use these as hard constraints:
         selected_keywords: Optional[List[str]] = None,
         field_inputs: Optional[Dict[str, List[str]]] = None,
         vision_analysis: Optional[Dict] = None,
+        concept_model: Optional[str] = None,
     ):
         from pydantic import BaseModel, Field
 
@@ -596,9 +761,28 @@ Use these as hard constraints:
         normalized_fields = self._normalize_field_inputs(field_inputs)
         baseline = self._extract_baseline_fields(description, vision_analysis, normalized_fields)
 
-        field_context = ""
-        if any(len(v) > 0 for v in normalized_fields.values()):
-            field_context = f"""
+        # ── Smart classification ──
+        changed, locked = self._classify_fields(normalized_fields, vision_analysis)
+        num_changed = len(changed)
+        use_full_exploration = (num_changed == 0)
+
+        print(f"[iter_concepts] changed={list(changed.keys())} locked={list(locked.keys())} → mode={'full' if use_full_exploration else 'smart'}")
+
+        creative_llm, resolved_model = self._get_creative_llm(concept_model)
+        print(f"Streaming concept model: {resolved_model}")
+        structured_llm = creative_llm.with_structured_output(SingleConcept)
+
+        keywords_context = ""
+        if selected_keywords and len(selected_keywords) > 0:
+            keywords_context = f"\nUser-selected keywords to integrate strongly: {', '.join(selected_keywords)}."
+
+        # ════════════════════════════════════════════════════════════
+        #  MODE A: Full exploration (6 groups, original behavior)
+        # ════════════════════════════════════════════════════════════
+        if use_full_exploration:
+            field_context = ""
+            if any(len(v) > 0 for v in normalized_fields.values()):
+                field_context = f"""
 
 User provided field values (prioritize these):
 - Subject: {normalized_fields['subject']}
@@ -609,23 +793,25 @@ User provided field values (prioritize these):
 - Context: {normalized_fields['context']}
 """
 
-        keywords_context = ""
-        if selected_keywords and len(selected_keywords) > 0:
-            keywords_context = f"\nUser-selected keywords to integrate strongly: {', '.join(selected_keywords)}."
+            focus_specs = [
+                ("Subject", "subject"),
+                ("Action", "action"),
+                ("Context", "context"),
+                ("Mood", "mood"),
+                ("Style", "art_style"),
+                ("Color", "colors"),
+            ]
 
-        focus_specs = [
-            ("Subject", "subject"),
-            ("Action", "action"),
-            ("Context", "context"),
-            ("Mood", "mood"),
-            ("Style", "art_style"),
-            ("Color", "colors"),
-        ]
+            # Yield metadata first
+            yield {
+                "_meta": True,
+                "mode": "full",
+                "total": 6,
+                "groups_info": [{"focus": f[0], "cards": 3} for f in focus_specs],
+            }
 
-        structured_llm = self.creative_llm.with_structured_output(SingleConcept)
-
-        for focus_name, focus_key in focus_specs:
-            prompt = f"""
+            for focus_name, focus_key in focus_specs:
+                prompt = f"""
 You are a Creative Director for POD T-shirt concepts.
 
 Original image analysis:
@@ -655,10 +841,10 @@ Rules:
 - visual_prompt must be detailed and print-on-demand ready.
 - focus must be exactly "{focus_name}".
 """
-            if user_instruction:
-                prompt += f'\nUser instruction to honor: "{user_instruction}"\n'
+                if user_instruction:
+                    prompt += f'\nUser instruction to honor: "{user_instruction}"\n'
 
-            prompt += """
+                prompt += """
 Output JSON object:
 {
   "concept": {
@@ -676,10 +862,141 @@ Output JSON object:
   }
 }
 """
-            response = structured_llm.invoke([HumanMessage(content=prompt)])
-            concept_dict = response.concept.model_dump()
-            concept_dict = self._coerce_concept_shape(concept_dict, focus_name, baseline)
-            yield concept_dict
+                response = structured_llm.invoke([HumanMessage(content=prompt)])
+                concept_dict = response.concept.model_dump()
+                concept_dict = self._coerce_concept_shape(concept_dict, focus_name, baseline)
+                concept_dict["mode"] = "full"
+                yield concept_dict
+
+        # ════════════════════════════════════════════════════════════
+        #  MODE B: Smart mode (Cartesian combos, grouped)
+        # ════════════════════════════════════════════════════════════
+        else:
+            groups, primary_field, total_cards = self._build_smart_combos(changed, locked)
+
+            # Build groups_info for metadata
+            field_to_focus = {
+                "subject": "Subject", "action": "Action", "mood": "Mood",
+                "style": "Style", "colors": "Color", "context": "Context",
+            }
+            primary_focus_name = field_to_focus.get(primary_field, primary_field.capitalize())
+
+            groups_info = []
+            for g in groups:
+                groups_info.append({
+                    "focus": primary_focus_name,
+                    "group_value": g["group_value"],
+                    "cards": len(g["combos"]),
+                })
+
+            # Yield metadata first
+            yield {
+                "_meta": True,
+                "mode": "smart",
+                "total": len(groups),
+                "total_cards": total_cards,
+                "primary_field": primary_field,
+                "changed_fields": list(changed.keys()),
+                "groups_info": groups_info,
+            }
+
+            # Map field names for prompt building
+            field_key_to_concept = {
+                "subject": "subject", "action": "action", "mood": "mood",
+                "style": "art_style", "colors": "colors", "context": "context",
+            }
+
+            class SmartConcept(BaseModel):
+                title: str = Field(description="Catchy title for the T-shirt design")
+                visual_prompt: str = Field(description="Full detailed prompt for AI image generator")
+                caption: str = Field(description="Text or slogan on the shirt")
+                logic: str = Field(description="Why this design works commercially")
+
+            smart_llm = creative_llm.with_structured_output(SmartConcept)
+
+            for gi, group in enumerate(groups):
+                # Build sub-cards for this group
+                sub_cards = []
+                for si, combo in enumerate(group["combos"]):
+                    # Map field_inputs keys to concept keys
+                    concept_fields = {}
+                    for fk, ck in field_key_to_concept.items():
+                        concept_fields[ck] = combo.get(fk, locked.get(fk, ""))
+
+                    # AI generates title + visual_prompt for this combo
+                    combo_desc = ", ".join([
+                        f"{k}: {v}" for k, v in concept_fields.items() if v
+                    ])
+                    prompt = f"""
+You are a Creative Director for POD T-shirt concepts.
+
+Original image analysis:
+{description}
+
+RAG inspiration:
+{rag_ideas}
+{keywords_context}
+
+Generate a catchy title and a highly detailed visual_prompt for this specific T-shirt concept:
+
+FIELD VALUES:
+- subject: {concept_fields.get('subject', '')}
+- action: {concept_fields.get('action', '')}
+- context: {concept_fields.get('context', '')}
+- mood: {concept_fields.get('mood', '')}
+- art_style: {concept_fields.get('art_style', '')}
+- colors: {concept_fields.get('colors', '')}
+
+Rules:
+- visual_prompt must be detailed, cohesive, and print-on-demand ready.
+- Include composition, lighting, texture hints.
+- Target 80-150 words for visual_prompt.
+- Title should be catchy and commercial.
+- Explain briefly why this combo works in 'logic'.
+"""
+                    if user_instruction:
+                        prompt += f'\nUser instruction to honor: "{user_instruction}"\n'
+
+                    response = smart_llm.invoke([HumanMessage(content=prompt)])
+                    smart_result = response.model_dump()
+
+                    sub_card = {
+                        "sub_label": f"{gi + 1}.{si + 1}",
+                        "title": smart_result.get("title", ""),
+                        "visual_prompt": smart_result.get("visual_prompt", ""),
+                        "caption": smart_result.get("caption", ""),
+                        "logic": smart_result.get("logic", ""),
+                        **concept_fields,
+                    }
+                    sub_cards.append(sub_card)
+
+                # Build concept dict compatible with frontend
+                # Focus field gets all values from this group's combos
+                # Other fields get single locked value
+                focus_key = field_key_to_concept.get(primary_field, primary_field)
+                concept_dict = {
+                    "title": f"{group['group_value']} Variations",
+                    "visual_prompt": sub_cards[0]["visual_prompt"] if sub_cards else "",
+                    "caption": sub_cards[0].get("caption", "") if sub_cards else "",
+                    "logic": sub_cards[0].get("logic", "") if sub_cards else "",
+                    "focus": primary_focus_name,
+                    "mode": "smart",
+                    "sub_cards": sub_cards,
+                    "group_value": group["group_value"],
+                }
+
+                # Fill field arrays
+                for fk, ck in field_key_to_concept.items():
+                    if fk == primary_field:
+                        concept_dict[ck] = [group["group_value"]]
+                    elif fk in changed:
+                        # Secondary changed fields: collect unique values across combos
+                        vals = list(dict.fromkeys(sc[ck] for sc in sub_cards if sc.get(ck)))
+                        concept_dict[ck] = vals if vals else [locked.get(fk, "")]
+                    else:
+                        concept_dict[ck] = [locked.get(fk, "")]
+
+                yield concept_dict
 
     def generate_mixed_subcards(self, concepts: list, vision_analysis: dict = None, strict_subject_swap: bool = False) -> list:
         """
