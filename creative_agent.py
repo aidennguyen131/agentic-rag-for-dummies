@@ -18,7 +18,7 @@ import csv
 import re
 import json
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 
 class CreativeAgent:
     def __init__(self):
@@ -49,7 +49,7 @@ class CreativeAgent:
         self._creative_llm_cache = {}
 
         # Vision analysis remains fixed on Gemini Pro.
-        self.vision_llm = ChatGoogleGenerativeAI(model=self.default_vision_model, max_tokens=4000)
+        self.vision_llm = ChatGoogleGenerativeAI(model=self.default_vision_model, max_tokens=10000)
         self.creative_llm, _ = self._get_creative_llm(self.default_concept_model)
 
     def _normalize_concept_model(self, concept_model: Optional[str]) -> str:
@@ -137,63 +137,255 @@ class CreativeAgent:
             b64 = base64.b64encode(image_file.read()).decode("utf-8")
             return f"data:{mime_type};base64,{b64}"
 
+    def _normalize_palette_list(self, colors_value: Any) -> List[str]:
+        if isinstance(colors_value, list):
+            return [str(v).strip() for v in colors_value if str(v).strip()]
+        text = str(colors_value or "").strip()
+        if not text:
+            return []
+        return [c.strip() for c in re.split(r",|\||/|;", text) if c.strip()]
+
+    def _normalize_text_list(self, value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        text = str(value or "").strip()
+        if not text:
+            return []
+        return [v.strip() for v in re.split(r",|\||/|;|\n", text) if v.strip()]
+
+
+
+    def _coerce_prompt_json_object(self, value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+        return {}
+
+    def _count_words(self, text: Any) -> int:
+        content = str(text or "").strip()
+        if not content:
+            return 0
+        return len(re.findall(r"\b[\w'-]+\b", content))
+
+    def _expand_prompt_to_min_words(
+        self,
+        visual_prompt: str,
+        concept_fields: Dict[str, Any],
+        min_words: int = 800,
+    ) -> str:
+        text = str(visual_prompt or "").strip()
+        if not text:
+            text = (
+                f"Create a print-ready apparel illustration featuring {concept_fields.get('subject', 'the main subject')} "
+                f"{concept_fields.get('action', '')} in {concept_fields.get('context', 'a clear visual setting')}, "
+                f"with mood {concept_fields.get('mood', 'balanced and coherent')}, in {concept_fields.get('art_style', 'a strong commercial style')} "
+                f"and palette {concept_fields.get('colors', 'cohesive high-contrast colors')}."
+            )
+
+        subject = str(concept_fields.get("subject", "")).strip()
+        action = str(concept_fields.get("action", "")).strip()
+        context = str(concept_fields.get("context", "")).strip()
+        mood = str(concept_fields.get("mood", "")).strip()
+        art_style = str(concept_fields.get("art_style", "")).strip()
+        colors = str(concept_fields.get("colors", "")).strip()
+
+        enrichment = (
+            "Production directives: keep the character silhouette clear at thumbnail and shirt-print size, maintain strong separation between foreground subject and background elements, and avoid clutter near the outer contour. "
+            f"Subject fidelity: preserve {subject or 'the main subject'} as the hero element with unmistakable anatomy and visual identity. "
+            f"Action fidelity: stage {action or 'the core action'} with readable gesture arcs, clear limb placement, and convincing weight distribution so the motion reads instantly. "
+            f"Context fidelity: build {context or 'the environment'} with layered depth cues, controlled spacing, and secondary elements that support the story without stealing focus. "
+            f"Mood fidelity: sustain {mood or 'the intended emotional tone'} through pose, expression, color contrast, line rhythm, and visual pacing. "
+            f"Style fidelity: execute in {art_style or 'the requested style'} with disciplined linework, intentional shape language, and consistent rendering logic from head to toe. "
+            f"Color fidelity: use {colors or 'the specified palette'} with high print contrast, preserve dominant accent hierarchy, and avoid muddy blends. "
+            "Lighting directives: define key light direction, edge highlights, form shadows, and reflected light zones; keep values organized for high readability on textile prints. "
+            "Composition directives: center the focal hierarchy, lock primary action near the visual anchor, and distribute supporting motifs to balance left-right and top-bottom weight. "
+            "Detail directives: include material definition for fabric, metal, fur, skin, or props as relevant; ensure micro-details are crisp but not noisy. "
+            "Print optimization directives: avoid tiny unreadable details, avoid low-contrast color-on-color collisions, and maintain strong negative space around critical edges. "
+            "Output constraints: keep composition self-contained, no accidental crop of key anatomy, no visual tangents that break readability, and no conflicting style artifacts."
+        )
+
+        expanded = text
+        while self._count_words(expanded) < min_words:
+            expanded = f"{expanded}\n\n{enrichment}"
+
+        return expanded.strip()
+
+    def _build_prompt_json_from_concept_fields(
+        self,
+        concept_fields: Dict[str, Any],
+        visual_prompt_text: str = "",
+    ) -> Dict[str, Any]:
+        prompt_json: Dict[str, Any] = {}
+
+        subject = str(concept_fields.get("subject", "")).strip()
+        action = str(concept_fields.get("action", "")).strip()
+        context = str(concept_fields.get("context", "")).strip()
+        mood = str(concept_fields.get("mood", "")).strip()
+        art_style = str(concept_fields.get("art_style", "")).strip()
+        colors = str(concept_fields.get("colors", "")).strip()
+
+        if subject:
+            prompt_json["subject"] = subject
+        if action:
+            prompt_json["action"] = action
+        if context:
+            prompt_json["context"] = context
+        if mood:
+            prompt_json["mood"] = mood
+        if art_style:
+            prompt_json["style"] = art_style
+
+        palette = self._normalize_palette_list(colors)
+        if palette:
+            prompt_json["color_palette"] = palette
+        elif colors:
+            prompt_json["colors"] = colors
+
+        if visual_prompt_text.strip():
+            prompt_json["notes"] = visual_prompt_text.strip()
+
+        return prompt_json
+
+    def _get_vision_field_value(self, source: Optional[Dict[str, Any]], field: str) -> str:
+        source = source if isinstance(source, dict) else {}
+        def _flatten(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, (int, float, bool)):
+                return str(value).strip()
+            if isinstance(value, list):
+                parts = []
+                for item in value:
+                    text = _flatten(item)
+                    if text:
+                        parts.append(text)
+                dedup = list(dict.fromkeys(parts))
+                return ", ".join(dedup)
+            if isinstance(value, dict):
+                preferred_order = [
+                    "subject", "type", "name", "primary_focus",
+                    "action", "pose",
+                    "context", "background", "setting",
+                    "style", "visual_family", "genre",
+                    "mood",
+                    "colors", "color_palette", "dominant_colors", "supporting_colors",
+                ]
+                parts = []
+                for key in preferred_order:
+                    if key in value:
+                        text = _flatten(value.get(key))
+                        if text:
+                            parts.append(text)
+                if not parts:
+                    for nested in value.values():
+                        text = _flatten(nested)
+                        if text:
+                            parts.append(text)
+                dedup = list(dict.fromkeys(parts))
+                return ", ".join(dedup)
+            return str(value).strip()
+
+        def _get_path(obj: Dict[str, Any], path: str) -> Any:
+            cur: Any = obj
+            for part in path.split("."):
+                if not isinstance(cur, dict) or part not in cur:
+                    return None
+                cur = cur[part]
+            return cur
+
+        path_map = {
+            "subject": [
+                "subject",
+                "prompt_json.subject",
+                "prompt_json.composition.subject",
+                "prompt_json.meta.primary_focus",
+            ],
+            "action": [
+                "action",
+                "prompt_json.action",
+                "prompt_json.composition.action",
+                "prompt_json.composition.pose",
+                "prompt_json.subject.pose",
+            ],
+            "context": [
+                "context",
+                "prompt_json.context",
+                "prompt_json.composition.background",
+                "prompt_json.background.setting",
+                "prompt_json.background.elements",
+                "prompt_json.background.main_graphic",
+            ],
+            "mood": [
+                "mood",
+                "prompt_json.mood",
+                "prompt_json.style.mood",
+            ],
+            "art_style": [
+                "art_style",
+                "style",
+                "prompt_json.art_style",
+                "prompt_json.style",
+                "prompt_json.style.visual_family",
+                "prompt_json.style.genre",
+            ],
+            "colors": [
+                "colors",
+                "prompt_json.colors",
+                "prompt_json.color_palette",
+                "prompt_json.color_palette.dominant_colors",
+                "prompt_json.color_palette.supporting_colors",
+            ],
+        }
+
+        for path in path_map.get(field, [field]):
+            raw = _get_path(source, path)
+            text = _flatten(raw)
+            if text:
+                return text
+
+        return ""
+
     def analyze_image(self, image_path):
         print(f"Analyzing image: {image_path}...")
-        
-        from pydantic import BaseModel, Field
-        from typing import List
-
-        class VisionAnalysis(BaseModel):
-            subject: str = Field(description="The main character or subject")
-            action: str = Field(description="What the subject is doing")
-            context: str = Field(description="Environment, background, or setting")
-            art_style: str = Field(description="The visual style (e.g. vintage, vector, photo-real)")
-            colors: str = Field(description="Dominant colors and palette description")
-            mood: str = Field(description="The emotional tone (e.g. funny, scary, serious)")
-            key_elements: List[str] = Field(description="List of other important visual elements")
-            composition: str = Field(default="", description="Composition breakdown: foreground, midground, background, focal point, and framing")
-            lighting: str = Field(default="", description="Lighting direction, intensity, contrast, and shadows/highlights")
-            camera_angle: str = Field(default="", description="Viewpoint and lens feeling (e.g. eye-level, low-angle, close-up, wide shot)")
-            linework: str = Field(default="", description="Line quality details: thickness, cleanliness, sketchiness, edge treatment")
-            texture_details: str = Field(default="", description="Surface/material textures and print-relevant details (grain, halftone, distress, brush marks)")
-            typography: str = Field(default="", description="Text treatment if present: wording area, font vibe, layout, readability")
-            negative_constraints: str = Field(default="", description="What should be avoided in generation to preserve style fidelity and print usability")
-            visual_prompt: str = Field(description="A highly detailed cohesive text-to-image prompt")
 
         image_data_url = self.encode_image(image_path)
         
-        prompt_instruction = """Analyze this image for a POD T-shirt design and return JSON strictly matching the schema.
+        prompt_instruction = """Analyze this image in very high detail and create a rich JSON prompt package for image generation.
 
-Your analysis must be detailed, concrete, and production-oriented for print design.
+Return ONE valid JSON object only (no markdown code fences, no extra text).
 
-Requirements:
-1. SUBJECT/ACTION/CONTEXT/MOOD/STYLE/COLORS:
-   - Be specific, avoid vague labels.
-   - Preserve what is actually in the image (do not "clean up" rough art unless it is truly clean).
-2. KEY_ELEMENTS:
-   - List 6-12 important visual elements (objects, symbols, motifs, accessories, background items).
-3. COMPOSITION:
-   - Describe foreground/midground/background, focal point, subject scale, spacing, and framing.
-4. LIGHTING:
-   - Describe key light direction, contrast, shadows, highlights, color temperature.
-5. CAMERA_ANGLE:
-   - Describe perspective and shot type (eye-level/low-angle/top-down, close/medium/wide).
-6. LINEWORK:
-   - Describe line thickness, edge quality, sketchiness/cleanliness, contour behavior.
-7. TEXTURE_DETAILS:
-   - Describe textures and print-relevant effects (grain, halftone, noise, distress, brush strokes, ink bleed, gradients).
-8. TYPOGRAPHY:
-   - If text exists, describe placement, hierarchy, style, and readability; otherwise explicitly say "No visible typography".
-9. NEGATIVE_CONSTRAINTS:
-   - List what to avoid in generation (wrong style shifts, clutter, unreadable details, trademark/copyrighted characters, NSFW).
-10. VISUAL_PROMPT:
-   - Write one cohesive, high-detail, generation-ready prompt that faithfully preserves the original style and composition.
-   - Minimum length: 250 words. Target range: 250-350 words.
-   - Include explicit details for subject anatomy/pose, props, foreground/midground/background, lighting setup, texture treatment, line quality, palette behavior, and print composition.
-   - Include medium/style/texture/lighting/composition details and clear print-friendly constraints.
-   - Keep it safe and free of trademarked character names.
+Primary goal:
+- Capture as much useful visual information as possible while staying faithful to the image.
 
-Do not output markdown. Output only valid JSON.
+Required fields:
+1. "visual_prompt":
+   - A long, detailed, cohesive text-to-image prompt.
+   - Describe subject, action, scene, style, materials, lighting, composition, textures, colors, mood, and rendering details.
+2. "prompt_json":
+   - A deeply structured JSON object for generation.
+   - Include nested keys where useful: subject, environment, composition, style, color_palette, lighting, camera, materials, texture, typography, effects, constraints, print_notes.
+
+Detail policy:
+- Be exhaustive and include fine-grained details (shape, proportions, pose, line quality, brush/ink behavior, surface feel, distress patterns, highlights/shadows, depth layering, focal hierarchy).
+- If text/typography exists, describe content, placement, style, readability, and visual role.
+- If ambiguity exists, include an "assumptions" field with best-effort interpretations.
+- Include "negative_constraints" (what to avoid) and "confidence" scores (0-1) for major inferred groups when possible.
+
+Output format rules:
+- Output must be valid JSON.
+- Do not use markdown.
+- Do not omit required fields.
 """
 
         message = HumanMessage(
@@ -205,20 +397,58 @@ Do not output markdown. Output only valid JSON.
                 },
             ]
         )
-        # Use structured output
-        structured_llm = self.vision_llm.with_structured_output(VisionAnalysis)
-        response = structured_llm.invoke([message])
         
-        # Return the dict, or handle it in run()
-        # For compatibility with existing string-based flow, we might need to adjust,
-        # but let's return the dict object so we can pass it to frontend.
-        # However, mix_and_create expects a description string.
-        # We should return the dict, and let caller handle it.
-        # Wait, if we change return type, we break mix_and_create which expects a string description?
-        # Let's check mix_and_create usage. It uses 'description' in prompt. 
-        # We can accept dict in mix_and_create or convert dict to string there.
-        # Let's return the object (Pydantic model) and convert to string where needed.
-        return response
+        # Use simple invoke for freeform JSON instead of rigid Pydantic output
+        response = self.vision_llm.invoke([message])
+        
+        # Extract text content safely because Gemini might return a list of dicts
+        raw_content = response.content
+        if isinstance(raw_content, list):
+            texts = [part.get("text", "") for part in raw_content if isinstance(part, dict) and "text" in part]
+            text_content = "".join(texts).strip()
+            # In some cases parts could be string items
+            if not text_content:
+                text_content = "".join([str(p) for p in raw_content if isinstance(p, str)]).strip()
+        else:
+            text_content = str(raw_content).strip()
+        
+        # Clean markdown code block formatting if present
+        if text_content.startswith("```json"):
+            text_content = text_content[7:]
+        elif text_content.startswith("```"):
+            text_content = text_content[3:]
+        if text_content.endswith("```"):
+            text_content = text_content[:-3]
+        text_content = text_content.strip()
+        
+        print("\n\n[DEBUG] --- RAW TEXT CONTENT EXTRACTED FROM LLM ---")
+        print(text_content)
+        print("[DEBUG] -------------------------------------------\n")
+
+        try:
+            payload = json.loads(text_content)
+            print("[DEBUG] Successfully parsed unstructured JSON.")
+        except Exception as e:
+            print(f"[DEBUG] Failed to parse LLM JSON: {e}")
+            payload = {
+                "raw_text": text_content, 
+                "visual_prompt": text_content,
+                "prompt_json": {}
+            }
+
+        # Provide raw debugging text to frontend
+        payload["__raw_debug_json"] = text_content
+
+        # Create a dynamic dictionary object to maintain model_dump compatibility with existing code
+        class DynamicAnalysis(dict):
+            def model_dump(self):
+                return dict(self)
+            def model_dump_json(self):
+                return json.dumps(dict(self), indent=4)
+            def __getattr__(self, item):
+                return self.get(item)
+
+        return DynamicAnalysis(payload)
 
     def retrieve_ideas(self, description, user_instruction=None):
         print("Retrieving related concepts from RAG...")
@@ -280,7 +510,7 @@ Do not output markdown. Output only valid JSON.
         for field in ["subject", "action", "mood", "style", "colors", "context"]:
             user_vals = normalized_fields.get(field, [])
             baseline_key = baseline_map.get(field, field)
-            baseline_val = str(source.get(baseline_key, "")).strip()
+            baseline_val = self._get_vision_field_value(source, baseline_key)
 
             if len(user_vals) > 1:
                 # Multiple values → user wants variation in this field
@@ -510,7 +740,7 @@ Output:
             if not values:
                 return values
             vision_key = vision_key_map.get(field, field)
-            vision_value = str((vision_analysis or {}).get(vision_key, "")).strip().lower()
+            vision_value = self._get_vision_field_value(vision_analysis or {}, vision_key).lower()
             if not vision_value:
                 return values
             filtered = [v for v in values if str(v).strip().lower() != vision_value]
@@ -555,26 +785,15 @@ Output:
 
     def mix_and_create(self, description, rag_ideas, user_instruction=None, selected_keywords=None, field_inputs=None, concept_model: Optional[str] = None):
         print("Mixing ideas...")
-        from pydantic import BaseModel, Field
         from typing import List
 
-        class Concept(BaseModel):
-            title: str = Field(description="Catchy title for the T-shirt design")
-            visual_prompt: str = Field(description="Full prompt for AI image generator")
-            # Structured breakdown – each field is a list of 3 AI-suggested alternatives
-            subject: List[str] = Field(description="3 alternative main characters/subjects (the first one is the primary choice)")
-            action: List[str] = Field(description="3 alternative actions the subject could perform (the first one is the primary choice)")
-            context: List[str] = Field(description="3 alternative environments or background elements (the first one is the primary choice)")
-            mood: List[str] = Field(description="3 alternative emotional tones or vibes (the first one is the primary choice)")
-            art_style: List[str] = Field(description="3 alternative art styles (the first one is the primary choice)")
-            colors: List[str] = Field(description="3 alternative color palettes (the first one is the primary choice)")
-
-            caption: str = Field(description="Text or slogan on the shirt")
-            logic: str = Field(description="Business logic or why this design works")
-            focus: str = Field(description="The specific element that was changed, e.g., 'Subject', 'Action', 'Context', 'Mood', 'Style', 'Color'")
-
-        class DesignConcepts(BaseModel):
-            concepts: List[Concept]
+        class DynamicConcept(dict):
+            def model_dump(self):
+                return dict(self)
+            def model_dump_json(self):
+                return json.dumps(dict(self), indent=4)
+            def __getattr__(self, item):
+                return self.get(item)
 
         normalized_fields = self._normalize_field_inputs(field_inputs)
         field_context = ""
@@ -665,27 +884,63 @@ Use these as hard constraints:
             
         prompt += """
         
-        Output Format:
-        Return a JSON with EXACTLY 6 concepts (one per strategy above).
-        For each concept, provide:
-        - title: Catchy name (based on the primary/first variant).
-        - visual_prompt: Full detailed prompt using the PRIMARY (first) value of each field.
-        - subject: LIST with EXACTLY 3 values if focus="Subject", else LIST with EXACTLY 1 value.
-        - action: LIST with EXACTLY 3 values if focus="Action", else LIST with EXACTLY 1 value.
-        - context: LIST with EXACTLY 3 values if focus="Context", else LIST with EXACTLY 1 value.
-        - mood: LIST with EXACTLY 3 values if focus="Mood", else LIST with EXACTLY 1 value.
-        - art_style: LIST with EXACTLY 3 values if focus="Style", else LIST with EXACTLY 1 value.
-        - colors: LIST with EXACTLY 3 values if focus="Color", else LIST with EXACTLY 1 value.
-        - caption: Shirt slogan text.
-        - logic: Explain the strategy used and why it works.
-        - focus: ONE word – "Subject", "Action", "Context", "Mood", "Style", or "Color".
+        CRITICAL REQUIREMENT: Output ONLY valid JSON matching the structure below. Do not wrap it in markdown blocks. Just return the raw JSON object.
+        {
+          "concepts": [
+            {
+              "title": "...",
+              "visual_prompt": "...",
+              "visual_prompt_json": { ... },
+              "subject": ["...", "...", "..."],
+              "action": ["..."],
+              "context": ["..."],
+              "mood": ["..."],
+              "art_style": ["..."],
+              "colors": ["..."],
+              "caption": "...",
+              "logic": "...",
+              "focus": "..."
+            }
+          ]
+        }
         """
         
         creative_llm, resolved_model = self._get_creative_llm(concept_model)
         print(f"Concept generation model: {resolved_model}")
-        structured_llm = creative_llm.with_structured_output(DesignConcepts)
-        response = structured_llm.invoke([HumanMessage(content=prompt)])
-        return response.concepts
+        response = creative_llm.invoke([HumanMessage(content=prompt)])
+        
+        raw_text = response.content
+        if isinstance(raw_text, list):
+            texts = [part.get("text", "") for part in raw_text if isinstance(part, dict) and "text" in part]
+            raw_text = "".join(texts).strip()
+            if not raw_text:
+                raw_text = "".join([str(p) for p in response.content if isinstance(p, str)]).strip()
+        else:
+            raw_text = str(raw_text).strip()
+
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        elif raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
+        raw_text = raw_text.strip()
+        
+        try:
+            payload = json.loads(raw_text)
+            concept_dicts = payload.get("concepts", [])
+            if isinstance(concept_dicts, dict):
+                concept_dicts = list(concept_dicts.values())
+        except Exception as e:
+            print(f"[mix_and_create] Failed to parse JSON: {e}")
+            concept_dicts = []
+            
+        concepts_out = []
+        for cd in concept_dicts:
+            cd["__raw_debug_json"] = raw_text
+            concepts_out.append(DynamicConcept(cd))
+            
+        return concepts_out
 
     def _extract_baseline_fields(self, description, vision_analysis: Optional[Dict], normalized_fields: Dict[str, List[str]]) -> Dict[str, str]:
         baseline = {
@@ -715,7 +970,7 @@ Use these as hard constraints:
             "colors": "colors",
         }
         for out_key, src_key in key_map.items():
-            baseline[out_key] = str(source.get(src_key, "")).strip()
+            baseline[out_key] = self._get_vision_field_value(source, src_key)
 
         user_override_map = {
             "subject": "subject",
@@ -777,6 +1032,21 @@ Use these as hard constraints:
         else:
             concept["visual_prompt"] = str(concept["visual_prompt"]).strip()
 
+        prompt_json = self._coerce_prompt_json_object(concept.get("visual_prompt_json", {}))
+        if not prompt_json:
+            prompt_json = self._build_prompt_json_from_concept_fields(
+                {
+                    "subject": concept["subject"][0] if concept.get("subject") else "",
+                    "action": concept["action"][0] if concept.get("action") else "",
+                    "context": concept["context"][0] if concept.get("context") else "",
+                    "mood": concept["mood"][0] if concept.get("mood") else "",
+                    "art_style": concept["art_style"][0] if concept.get("art_style") else "",
+                    "colors": concept["colors"][0] if concept.get("colors") else "",
+                },
+                visual_prompt_text=concept.get("visual_prompt", ""),
+            )
+        concept["visual_prompt_json"] = prompt_json
+
         return concept
 
     def iter_concepts(
@@ -789,23 +1059,7 @@ Use these as hard constraints:
         vision_analysis: Optional[Dict] = None,
         concept_model: Optional[str] = None,
     ):
-        from pydantic import BaseModel, Field
-
-        class Concept(BaseModel):
-            title: str = Field(description="Catchy title for the T-shirt design")
-            visual_prompt: str = Field(description="Full prompt for AI image generator")
-            subject: List[str] = Field(description="Subject values")
-            action: List[str] = Field(description="Action values")
-            context: List[str] = Field(description="Context values")
-            mood: List[str] = Field(description="Mood values")
-            art_style: List[str] = Field(description="Art style values")
-            colors: List[str] = Field(description="Color palette values")
-            caption: str = Field(description="Text or slogan on the shirt")
-            logic: str = Field(description="Business logic or why this design works")
-            focus: str = Field(description="Focus field name")
-
-        class SingleConcept(BaseModel):
-            concept: Concept
+        pass
 
         normalized_fields = self._normalize_field_inputs(field_inputs)
         baseline = self._extract_baseline_fields(description, vision_analysis, normalized_fields)
@@ -819,7 +1073,6 @@ Use these as hard constraints:
 
         creative_llm, resolved_model = self._get_creative_llm(concept_model)
         print(f"Streaming concept model: {resolved_model}")
-        structured_llm = creative_llm.with_structured_output(SingleConcept)
 
         keywords_context = ""
         if selected_keywords and len(selected_keywords) > 0:
@@ -886,34 +1139,74 @@ Rules:
 - For focus field: return EXACTLY 3 distinct values.
 - For all other fields: return EXACTLY 1 value each.
 - Keep non-focus fields aligned to baseline/user constraints.
-- The title and visual_prompt must use the first value of each field.
+- The title, visual_prompt, and visual_prompt_json must use the first value of each field.
 - visual_prompt must be detailed and print-on-demand ready.
+- visual_prompt_json must be a dynamic JSON prompt object (no rigid fixed schema).
 - focus must be exactly "{focus_name}".
 """
                 if user_instruction:
                     prompt += f'\nUser instruction to honor: "{user_instruction}"\n'
 
                 prompt += """
-Output JSON object:
+Output ONLY valid JSON. Do not wrap it in markdown blocks. Just return the raw JSON object.
 {
   "concept": {
     "title": "...",
     "visual_prompt": "...",
-    "subject": [...],
-    "action": [...],
-    "context": [...],
-    "mood": [...],
-    "art_style": [...],
-    "colors": [...],
+    "visual_prompt_json": { ... },
+    "subject": ["..."],
+    "action": ["..."],
+    "context": ["..."],
+    "mood": ["..."],
+    "art_style": ["..."],
+    "colors": ["..."],
     "caption": "...",
     "logic": "...",
     "focus": "..."
   }
 }
 """
-                response = structured_llm.invoke([HumanMessage(content=prompt)])
-                concept_dict = response.concept.model_dump()
+                response = creative_llm.invoke([HumanMessage(content=prompt)])
+                
+                raw_text = response.content
+                if isinstance(raw_text, list):
+                    texts = [part.get("text", "") for part in raw_text if isinstance(part, dict) and "text" in part]
+                    raw_text = "".join(texts).strip()
+                    if not raw_text:
+                        raw_text = "".join([str(p) for p in response.content if isinstance(p, str)]).strip()
+                else:
+                    raw_text = str(raw_text).strip()
+
+                if raw_text.startswith("```json"):
+                    raw_text = raw_text[7:]
+                elif raw_text.startswith("```"):
+                    raw_text = raw_text[3:]
+                if raw_text.endswith("```"):
+                    raw_text = raw_text[:-3]
+                raw_text = raw_text.strip()
+                
+                try:
+                    payload = json.loads(raw_text)
+                    concept_dict = payload.get("concept", payload)
+                except Exception as e:
+                    print(f"[iter_concepts] Failed to parse JSON: {e}")
+                    concept_dict = {
+                        "title": "Failed to parse",
+                        "visual_prompt": raw_text,
+                        "visual_prompt_json": {},
+                        "subject": [baseline.get("subject", "")],
+                        "action": [baseline.get("action", "")],
+                        "context": [baseline.get("context", "")],
+                        "mood": [baseline.get("mood", "")],
+                        "art_style": [baseline.get("art_style", "")],
+                        "colors": [baseline.get("colors", "")],
+                        "caption": "",
+                        "logic": "",
+                        "focus": focus_name
+                    }
+
                 concept_dict = self._coerce_concept_shape(concept_dict, focus_name, baseline)
+                concept_dict["__raw_debug_json"] = raw_text
                 concept_dict["mode"] = "full"
                 yield concept_dict
 
@@ -955,13 +1248,7 @@ Output JSON object:
                 "style": "art_style", "colors": "colors", "context": "context",
             }
 
-            class SmartConcept(BaseModel):
-                title: str = Field(description="Catchy title for the T-shirt design")
-                visual_prompt: str = Field(description="Full detailed prompt for AI image generator")
-                caption: str = Field(description="Text or slogan on the shirt")
-                logic: str = Field(description="Why this design works commercially")
-
-            smart_llm = creative_llm.with_structured_output(SmartConcept)
+            pass
 
             for gi, group in enumerate(groups):
                 # Build sub-cards for this group
@@ -986,7 +1273,7 @@ RAG inspiration:
 {rag_ideas}
 {keywords_context}
 
-Generate a catchy title and a highly detailed visual_prompt for this specific T-shirt concept:
+Generate a catchy title, a highly detailed visual_prompt, and a dynamic visual_prompt_json for this specific T-shirt concept:
 
 FIELD VALUES:
 - subject: {concept_fields.get('subject', '')}
@@ -999,22 +1286,94 @@ FIELD VALUES:
 Rules:
 - visual_prompt must be detailed, cohesive, and print-on-demand ready.
 - Include composition, lighting, texture hints.
-- Target 80-150 words for visual_prompt.
+- STRICT minimum length: visual_prompt MUST be at least 800 words.
+- visual_prompt_json must be a dynamic JSON prompt object tailored to this combo (no rigid fixed schema).
 - Title should be catchy and commercial.
 - Explain briefly why this combo works in 'logic'.
 """
                     if user_instruction:
                         prompt += f'\nUser instruction to honor: "{user_instruction}"\n'
 
-                    response = smart_llm.invoke([HumanMessage(content=prompt)])
-                    smart_result = response.model_dump()
+                    min_words = 800
+                    max_attempts = 3
+                    smart_result: Dict[str, Any] = {}
+                    visual_prompt_text = ""
+                    visual_prompt_words = 0
+                    prompt_with_feedback = prompt
+
+                    for attempt in range(1, max_attempts + 1):
+                        prompt_with_feedback_call = prompt_with_feedback + '\nCRITICAL REQUIREMENT: Output ONLY valid JSON representing the response. Do not wrap it in markdown blocks. Just return the raw JSON object: { "title": "...", "visual_prompt": "...", "visual_prompt_json": {...}, "caption": "...", "logic": "..." }'
+                        response = creative_llm.invoke([HumanMessage(content=prompt_with_feedback_call)])
+                        
+                        raw_text = response.content
+                        if isinstance(raw_text, list):
+                            texts = [part.get("text", "") for part in raw_text if isinstance(part, dict) and "text" in part]
+                            raw_text = "".join(texts).strip()
+                            if not raw_text:
+                                raw_text = "".join([str(p) for p in response.content if isinstance(p, str)]).strip()
+                        else:
+                            raw_text = str(raw_text).strip()
+
+                        if raw_text.startswith("```json"):
+                            raw_text = raw_text[7:]
+                        elif raw_text.startswith("```"):
+                            raw_text = raw_text[3:]
+                        if raw_text.endswith("```"):
+                            raw_text = raw_text[:-3]
+                        raw_text = raw_text.strip()
+                        
+                        try:
+                            smart_result = json.loads(raw_text)
+                        except Exception as e:
+                            print(f"[iter_concepts][smart] JSON parsing failed: {e}")
+                            smart_result = {"visual_prompt": raw_text, "visual_prompt_json": {}}
+
+                        smart_result["__raw_debug_json"] = raw_text
+                        visual_prompt_text = str(smart_result.get("visual_prompt", "") or "").strip()
+                        visual_prompt_words = self._count_words(visual_prompt_text)
+                        print(
+                            f"[iter_concepts][smart] {gi + 1}.{si + 1} "
+                            f"words={visual_prompt_words} attempt={attempt}/{max_attempts}"
+                        )
+                        if visual_prompt_words >= min_words:
+                            break
+
+                        prompt_with_feedback = (
+                            f"{prompt}\n\n"
+                            f"LENGTH REVISION (attempt {attempt}):\n"
+                            f"- Your previous visual_prompt had {visual_prompt_words} words.\n"
+                            f"- Rewrite ONLY visual_prompt so it has at least {min_words} words.\n"
+                            f"- Keep all field values and stylistic intent unchanged.\n"
+                            f"- Return the full JSON object again with title, visual_prompt, visual_prompt_json, caption, logic."
+                        )
+
+                    if visual_prompt_words < min_words:
+                        smart_result["visual_prompt"] = self._expand_prompt_to_min_words(
+                            visual_prompt_text,
+                            concept_fields=concept_fields,
+                            min_words=min_words,
+                        )
+                        visual_prompt_words = self._count_words(smart_result["visual_prompt"])
+                        print(
+                            f"[iter_concepts][smart] {gi + 1}.{si + 1} "
+                            f"fallback_expand_applied words={visual_prompt_words}"
+                        )
+
+                    prompt_json = self._coerce_prompt_json_object(smart_result.get("visual_prompt_json", {}))
+                    if not prompt_json:
+                        prompt_json = self._build_prompt_json_from_concept_fields(
+                            concept_fields,
+                            visual_prompt_text=str(smart_result.get("visual_prompt", "") or ""),
+                        )
 
                     sub_card = {
                         "sub_label": f"{gi + 1}.{si + 1}",
                         "title": smart_result.get("title", ""),
                         "visual_prompt": smart_result.get("visual_prompt", ""),
+                        "visual_prompt_json": prompt_json,
                         "caption": smart_result.get("caption", ""),
                         "logic": smart_result.get("logic", ""),
+                        "__raw_debug_json": smart_result.get("__raw_debug_json", ""),
                         **concept_fields,
                     }
                     sub_cards.append(sub_card)
@@ -1026,6 +1385,7 @@ Rules:
                 concept_dict = {
                     "title": f"{group['group_value']} Variations",
                     "visual_prompt": sub_cards[0]["visual_prompt"] if sub_cards else "",
+                    "visual_prompt_json": sub_cards[0].get("visual_prompt_json", {}) if sub_cards else {},
                     "caption": sub_cards[0].get("caption", "") if sub_cards else "",
                     "logic": sub_cards[0].get("logic", "") if sub_cards else "",
                     "focus": primary_focus_name,
@@ -1148,7 +1508,7 @@ For EACH sub-card:
 2. Write a CREATIVE, COHESIVE visual_prompt using all 6 chosen field values.
    The prompt should flow naturally and be detailed enough for high-fidelity generation.
    - Include composition, lighting, texture/material hints, and print constraints if available from baseline context.
-   - Target depth: around 90-160 words (not a short one-liner).
+   - MUST write a minimum of 200 words for the visual_prompt. There is no maximum limit. Make it as highly detailed and comprehensive as the original vision analysis prompt in length and depth.
    - Ensure white/clean background and print-on-demand readiness.
 
 OUTPUT:
@@ -1177,6 +1537,7 @@ Each group has:
 
         class RefinedConcept(BaseModel):
             visual_prompt: str = Field(description="The rewritten, highly detailed, flowing text-to-image prompt.")
+            visual_prompt_json: Dict[str, Any] = Field(default_factory=dict, description="Structured JSON prompt aligned with the rewritten concept.")
             subject: str = Field(description="Updated subject based on the instruction, or original if unchanged")
             action: str = Field(description="Updated action based on the instruction, or original if unchanged")
             context: str = Field(description="Updated context based on the instruction, or original if unchanged")
@@ -1184,6 +1545,7 @@ Each group has:
             art_style: str = Field(description="Updated art style based on the instruction, or original if unchanged")
             colors: str = Field(description="Updated colors based on the instruction, or original if unchanged")
 
+        current_concept = current_concept or {}
         concept_context = ""
         if current_concept:
             concept_context = f"\nCURRENT FIELDS:\n"
@@ -1205,11 +1567,70 @@ Each group has:
         Task:
         1. Rewrite the CURRENT PROMPT to carefully incorporate the USER INSTRUCTION. Ensure the new prompt remains cohesive, highly detailed, and flowing.
         2. Update the CURRENT FIELDS to reflect any changes caused by the user instruction. If a field is not affected by the instruction, keep its original value.
+        3. Return visual_prompt_json that is consistent with the rewritten prompt and updated fields.
+
+        CRITICAL OVERRIDE RULE:
+        - If the user explicitly requests a subject replacement (example: "change subject to cat"), you MUST set subject to the requested new subject and remove references to the old subject in both visual_prompt and visual_prompt_json.
         """
         
         structured_llm = self.creative_llm.with_structured_output(RefinedConcept)
         response = structured_llm.invoke([HumanMessage(content=prompt)])
-        return response.model_dump()
+        result = response.model_dump()
+
+        # Ensure missing fields are backfilled from current concept for stability.
+        for field in ("subject", "action", "context", "mood", "art_style", "colors"):
+            if not str(result.get(field, "")).strip():
+                result[field] = str(current_concept.get(field, "")).strip()
+
+        # Deterministic subject override when user instruction is explicit.
+        explicit_subject = ""
+        subject_patterns = [
+            r"change\s+subject\s+to\s+([^\n,.;]+)",
+            r"thay\s*doi\s+subject\s*(?:to|thanh)\s+([^\n,.;]+)",
+            r"thay\s*đổi\s+subject\s*(?:to|thành)\s+([^\n,.;]+)",
+            r"subject[^\n]{0,80}?(?:to|thanh|thành)\s+([^\n,.;]+)",
+        ]
+        for pattern in subject_patterns:
+            m = re.search(pattern, str(instruction or ""), flags=re.IGNORECASE)
+            if m:
+                explicit_subject = str(m.group(1) or "").strip().strip("'\"")
+                if explicit_subject:
+                    break
+        if explicit_subject:
+            old_subject = str(result.get("subject", "")).strip() or str(current_concept.get("subject", "")).strip()
+            result["subject"] = explicit_subject
+            vp = str(result.get("visual_prompt", "") or "")
+            if vp and old_subject and old_subject.lower() != explicit_subject.lower():
+                result["visual_prompt"] = re.sub(re.escape(old_subject), explicit_subject, vp, flags=re.IGNORECASE)
+
+        concept_fields = {
+            "subject": str(result.get("subject", "")).strip(),
+            "action": str(result.get("action", "")).strip(),
+            "context": str(result.get("context", "")).strip(),
+            "mood": str(result.get("mood", "")).strip(),
+            "art_style": str(result.get("art_style", "")).strip(),
+            "colors": str(result.get("colors", "")).strip(),
+        }
+
+        llm_json = self._coerce_prompt_json_object(result.get("visual_prompt_json", {}))
+        fallback_json = self._build_prompt_json_from_concept_fields(
+            concept_fields,
+            visual_prompt_text=str(result.get("visual_prompt", "") or ""),
+        )
+        # Prefer LLM JSON when available, but guarantee key concept fields exist.
+        prompt_json = dict(fallback_json)
+        prompt_json.update(llm_json)
+        if concept_fields["subject"] and not str(prompt_json.get("subject", "")).strip():
+            prompt_json["subject"] = concept_fields["subject"]
+        if concept_fields["action"] and not str(prompt_json.get("action", "")).strip():
+            prompt_json["action"] = concept_fields["action"]
+        if concept_fields["context"] and not str(prompt_json.get("context", "")).strip():
+            prompt_json["context"] = concept_fields["context"]
+        if concept_fields["mood"] and not str(prompt_json.get("mood", "")).strip():
+            prompt_json["mood"] = concept_fields["mood"]
+
+        result["visual_prompt_json"] = prompt_json
+        return result
 
     def run(self, image_path, user_instruction=None):
         # 1. Vision Analysis (Structured)
