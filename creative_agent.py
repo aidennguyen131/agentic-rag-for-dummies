@@ -20,6 +20,19 @@ import json
 from pydantic import BaseModel
 from typing import Any, List, Dict, Optional
 
+# Merged into visual_prompt_json when the model omits POD keys (print-on-demand safety).
+POD_BACKGROUND_DEFAULT = (
+    "Solid clean white or soft off-white backdrop for DTG apparel; artwork sized for the shirt print area. "
+    "Avoid incidental black letterboxing or full-canvas black margins unless the art style explicitly uses a "
+    "poster/mat border or cinematic frame as part of the design. Prefer full-bleed art or clear subject isolation."
+)
+POD_ALPHA_NOTE_DEFAULT = (
+    "Raster image APIs often cannot return true PNG alpha; if you need transparency, treat it as design intent "
+    "and plan background removal or masking after generation."
+)
+POD_LETTERBOXING_DEFAULT = "avoid"
+
+
 class CreativeAgent:
     def __init__(self):
         print("Initializing Creative Agent...")
@@ -170,6 +183,27 @@ class CreativeAgent:
                 return {}
         return {}
 
+    def _pod_json_prompt_rules(self) -> str:
+        """Instruction block pasted into Creative Director prompts for structured JSON."""
+        return """
+POD / PRINT — visual_prompt_json (required structured keys):
+- Include "pod_background" (string): intended background for apparel (e.g. solid white/off-white for DTG; or "isolated subject; transparent alpha intent" if the user wants cutout — image APIs may still output opaque pixels).
+- Include "pod_letterboxing" (string): "avoid" unless black borders are an intentional part of the art style (e.g. retro poster/mat).
+- Include "pod_alpha_note" (string): one short reminder that true PNG transparency may require post-processing.
+These keys align the JSON prompt with print workflows; keep them consistent with "visual_prompt" text.
+"""
+
+    def _merge_pod_visual_prompt_json(self, prompt_json: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Fill missing POD keys so downstream image gen and operators get stable defaults."""
+        out: Dict[str, Any] = dict(prompt_json) if isinstance(prompt_json, dict) else {}
+        if not str(out.get("pod_background", "")).strip():
+            out["pod_background"] = POD_BACKGROUND_DEFAULT
+        if not str(out.get("pod_letterboxing", "")).strip():
+            out["pod_letterboxing"] = POD_LETTERBOXING_DEFAULT
+        if not str(out.get("pod_alpha_note", "")).strip():
+            out["pod_alpha_note"] = POD_ALPHA_NOTE_DEFAULT
+        return out
+
     def _count_words(self, text: Any) -> int:
         content = str(text or "").strip()
         if not content:
@@ -253,7 +287,7 @@ class CreativeAgent:
         if visual_prompt_text.strip():
             prompt_json["notes"] = visual_prompt_text.strip()
 
-        return prompt_json
+        return self._merge_pod_visual_prompt_json(prompt_json)
 
     def _get_vision_field_value(self, source: Optional[Dict[str, Any]], field: str) -> str:
         source = source if isinstance(source, dict) else {}
@@ -820,6 +854,8 @@ Use these as hard constraints:
         if selected_keywords and len(selected_keywords) > 0:
             keywords_context = f"\n\n**MANDATORY USER SELECTED KEYWORDS/NICHES**:\nThe user has explicitly selected these keywords to focus on: {', '.join(selected_keywords)}.\nENSURE these keywords are heavily integrated into the concepts (either as subjects, themes, or puns)."
 
+        pod_json_rules = self._pod_json_prompt_rules()
+
         prompt = f"""
         You are a Creative Director for a POD (Print on Demand) T-shirt business.
         
@@ -830,6 +866,8 @@ Use these as hard constraints:
         {rag_ideas}
         {field_context}
         {keywords_context}
+        
+        {pod_json_rules}
         
         Task:
         Create EXACTLY 6 DISTINCT T-shirt design concept groups based on these strategies.
@@ -937,6 +975,8 @@ Use these as hard constraints:
             
         concepts_out = []
         for cd in concept_dicts:
+            vj = self._coerce_prompt_json_object(cd.get("visual_prompt_json"))
+            cd["visual_prompt_json"] = self._merge_pod_visual_prompt_json(vj)
             cd["__raw_debug_json"] = raw_text
             concepts_out.append(DynamicConcept(cd))
             
@@ -1045,7 +1085,7 @@ Use these as hard constraints:
                 },
                 visual_prompt_text=concept.get("visual_prompt", ""),
             )
-        concept["visual_prompt_json"] = prompt_json
+        concept["visual_prompt_json"] = self._merge_pod_visual_prompt_json(prompt_json)
 
         return concept
 
@@ -1104,6 +1144,8 @@ User provided field values (prioritize these):
                 ("Color", "colors"),
             ]
 
+            pod_json_rules = self._pod_json_prompt_rules()
+
             # Yield metadata first
             yield {
                 "_meta": True,
@@ -1124,6 +1166,8 @@ RAG inspiration:
 {field_context}
 {keywords_context}
 
+{pod_json_rules}
+
 Generate EXACTLY ONE concept focused on "{focus_name}".
 
 BASELINE LOCKED VALUES:
@@ -1141,7 +1185,7 @@ Rules:
 - Keep non-focus fields aligned to baseline/user constraints.
 - The title, visual_prompt, and visual_prompt_json must use the first value of each field.
 - visual_prompt must be detailed and print-on-demand ready.
-- visual_prompt_json must be a dynamic JSON prompt object (no rigid fixed schema).
+- visual_prompt_json must be a dynamic JSON prompt object; it MUST include the POD keys described above (pod_background, pod_letterboxing, pod_alpha_note) in addition to any creative fields.
 - focus must be exactly "{focus_name}".
 """
                 if user_instruction:
@@ -1250,6 +1294,8 @@ Output ONLY valid JSON. Do not wrap it in markdown blocks. Just return the raw J
 
             pass
 
+            pod_json_rules = self._pod_json_prompt_rules()
+
             for gi, group in enumerate(groups):
                 # Build sub-cards for this group
                 sub_cards = []
@@ -1273,6 +1319,8 @@ RAG inspiration:
 {rag_ideas}
 {keywords_context}
 
+{pod_json_rules}
+
 Generate a catchy title, a highly detailed visual_prompt, and a dynamic visual_prompt_json for this specific T-shirt concept:
 
 FIELD VALUES:
@@ -1287,7 +1335,7 @@ Rules:
 - visual_prompt must be detailed, cohesive, and print-on-demand ready.
 - Include composition, lighting, texture hints.
 - STRICT minimum length: visual_prompt MUST be at least 800 words.
-- visual_prompt_json must be a dynamic JSON prompt object tailored to this combo (no rigid fixed schema).
+- visual_prompt_json must be a dynamic JSON prompt object tailored to this combo; it MUST include POD keys (pod_background, pod_letterboxing, pod_alpha_note) as described above, plus any creative fields.
 - Title should be catchy and commercial.
 - Explain briefly why this combo works in 'logic'.
 """
@@ -1365,6 +1413,8 @@ Rules:
                             concept_fields,
                             visual_prompt_text=str(smart_result.get("visual_prompt", "") or ""),
                         )
+                    else:
+                        prompt_json = self._merge_pod_visual_prompt_json(prompt_json)
 
                     sub_card = {
                         "sub_label": f"{gi + 1}.{si + 1}",
@@ -1377,6 +1427,18 @@ Rules:
                         **concept_fields,
                     }
                     sub_cards.append(sub_card)
+
+                    # Progressive streaming: emit each sub-card as soon as it is ready so the UI can render 1.1, then 1.2, etc.
+                    yield {
+                        "_streaming_partial": True,
+                        "mode": "smart",
+                        "group_index": gi + 1,
+                        "group_value": group["group_value"],
+                        "primary_focus_name": primary_focus_name,
+                        "sub_index": si + 1,
+                        "subs_in_group": len(group["combos"]),
+                        "sub_card": sub_card,
+                    }
 
                 # Build concept dict compatible with frontend
                 # Focus field gets all values from this group's combos
@@ -1509,7 +1571,7 @@ For EACH sub-card:
    The prompt should flow naturally and be detailed enough for high-fidelity generation.
    - Include composition, lighting, texture/material hints, and print constraints if available from baseline context.
    - MUST write a minimum of 200 words for the visual_prompt. There is no maximum limit. Make it as highly detailed and comprehensive as the original vision analysis prompt in length and depth.
-   - Ensure white/clean background and print-on-demand readiness.
+   - Ensure print-on-demand readiness: prefer solid white/off-white garment backdrop unless the concept explicitly needs another treatment; avoid accidental black letterboxing unless intentional to the style.
 
 OUTPUT:
 Return a JSON with EXACTLY 5 groups.
@@ -1552,6 +1614,8 @@ Each group has:
             for k, v in current_concept.items():
                 concept_context += f"- {k.capitalize()}: {v}\n"
 
+        pod_json_rules = self._pod_json_prompt_rules()
+
         prompt = f"""
         You are an expert at writing highly detailed cohesive text-to-image prompts (for Midjourney/Dall-E).
         
@@ -1564,10 +1628,12 @@ Each group has:
         USER INSTRUCTION:
         {instruction}
         
+        {pod_json_rules}
+        
         Task:
         1. Rewrite the CURRENT PROMPT to carefully incorporate the USER INSTRUCTION. Ensure the new prompt remains cohesive, highly detailed, and flowing.
         2. Update the CURRENT FIELDS to reflect any changes caused by the user instruction. If a field is not affected by the instruction, keep its original value.
-        3. Return visual_prompt_json that is consistent with the rewritten prompt and updated fields.
+        3. Return visual_prompt_json that is consistent with the rewritten prompt and updated fields. Include POD keys pod_background, pod_letterboxing, and pod_alpha_note (see above).
 
         CRITICAL OVERRIDE RULE:
         - If the user explicitly requests a subject replacement (example: "change subject to cat"), you MUST set subject to the requested new subject and remove references to the old subject in both visual_prompt and visual_prompt_json.
@@ -1629,7 +1695,7 @@ Each group has:
         if concept_fields["mood"] and not str(prompt_json.get("mood", "")).strip():
             prompt_json["mood"] = concept_fields["mood"]
 
-        result["visual_prompt_json"] = prompt_json
+        result["visual_prompt_json"] = self._merge_pod_visual_prompt_json(prompt_json)
         return result
 
     def run(self, image_path, user_instruction=None):
