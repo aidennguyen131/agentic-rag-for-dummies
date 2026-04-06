@@ -32,6 +32,16 @@ POD_ALPHA_NOTE_DEFAULT = (
 )
 POD_LETTERBOXING_DEFAULT = "avoid"
 
+# Max suggestions per field for `suggest_field_inputs` when the client does not override.
+SUGGEST_FIELD_DEFAULT_LIMITS: Dict[str, int] = {
+    "subject": 3,
+    "action": 3,
+    "mood": 3,
+    "style": 3,
+    "colors": 3,
+    "context": 3,
+}
+
 
 class CreativeAgent:
     def __init__(self):
@@ -687,7 +697,8 @@ Output format rules:
         vision_analysis: dict,
         current_inputs: Optional[Dict[str, List[str]]] = None,
         target_field: Optional[str] = None,
-        force_regenerate: bool = False
+        force_regenerate: bool = False,
+        field_limits: Optional[Dict[str, int]] = None,
     ) -> Dict[str, List[str]]:
         from pydantic import BaseModel, Field
 
@@ -700,6 +711,20 @@ Output format rules:
             context: List[str] = Field(default_factory=list)
 
         normalized = self._normalize_field_inputs(current_inputs)
+        caps: Dict[str, int] = {
+            field: int(SUGGEST_FIELD_DEFAULT_LIMITS.get(field, 3)) for field in normalized.keys()
+        }
+        if isinstance(field_limits, dict):
+            for key, raw in field_limits.items():
+                if key not in caps:
+                    continue
+                try:
+                    n = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if n >= 1:
+                    caps[key] = min(n, 30)
+
         styles = self._load_style_rows()
         style_names = [row.get("Style", "").strip() for row in styles if row.get("Style", "").strip()]
         style_categories = [row.get("Category", "").strip() for row in styles if row.get("Category", "").strip()]
@@ -707,24 +732,25 @@ Output format rules:
 
         topic_keywords = self.get_preset_keywords()
         valid_target = target_field if target_field in normalized else ""
+        caps_json = json.dumps(caps, ensure_ascii=False)
+        subject_cap = caps.get("subject", 3)
 
         prompt = f"""
 You are a POD concept input assistant.
 
 Goal:
 - Return suggestions for 6 fields: subject, action, mood, style, colors, context.
-- Each field can contain 1 to 3 values.
+- Per-field maximum counts (never exceed these list lengths): {caps_json}
 - Keep suggestions coherent (avoid contradictions like mood=dark while colors=pastel cute unless intentionally stylistic).
 
 Rules:
 - If target_field is set:
   - Operate ONLY on that field and keep all other fields unchanged.
-  - If force_regenerate is FALSE: keep existing values for target field, then top up to max 3.
-  - If force_regenerate is TRUE: regenerate target field values from scratch.
+  - If force_regenerate is FALSE: keep existing values for target field, then top up to that field's max count in the caps above.
+  - If force_regenerate is TRUE: regenerate target field values from scratch (up to that field's max).
 - If target_field is empty:
-  - If force_regenerate is FALSE: keep existing values and top up to max 3 for all fields.
-  - If force_regenerate is TRUE: regenerate all fields from scratch.
-- Maximum 3 values per field.
+  - If force_regenerate is FALSE: keep existing values and top up each field toward its max in the caps.
+  - If force_regenerate is TRUE: regenerate all fields from scratch (respect each field's max).
 - Prefer using these data sources:
   1) Topic keywords from 50Topics_Keyword.csv
   2) Styles metadata from ArtStyles_v2.csv
@@ -732,6 +758,7 @@ Rules:
   - Subject suggestions must be different character identities (different species/archetypes/professions), not outfit/accessory variants of the same character.
   - Bad: "brown sloth", "sloth with goggles", "sloth in jacket".
   - Good: "red panda snowboarder", "retro robot courier", "samurai frog drummer".
+  - When the subject cap is {subject_cap}, return up to {subject_cap} distinct subjects (fewer only if you cannot find enough diverse options).
 - Do not copy Vision analysis values verbatim as suggestions. Prefer alternatives or paraphrased variants.
 
 Current field inputs:
@@ -754,7 +781,7 @@ Data source snippets:
 
 Output:
 - Return JSON only for fields: subject, action, mood, style, colors, context.
-- Each field must be a list with up to 3 concise values.
+- Each field must be a list with at most the length given in the caps (concise values).
 """
 
         structured_llm = self.creative_llm.with_structured_output(SuggestedFields)
@@ -782,14 +809,15 @@ Output:
 
         result = {}
         for field in normalized.keys():
+            cap = int(caps.get(field, 3))
             old_vals = normalized[field]
-            new_vals = [str(v).strip() for v in suggested.get(field, []) if str(v).strip()][:3]
+            new_vals = [str(v).strip() for v in suggested.get(field, []) if str(v).strip()][:cap]
             new_vals = _filter_verbatim_vision(field, new_vals)
             if field == "subject":
                 new_vals = self._dedupe_subject_candidates(
                     new_vals,
                     existing=old_vals if not force_regenerate else None,
-                    limit=3,
+                    limit=cap,
                 )
 
             if valid_target and field != valid_target:
@@ -800,7 +828,7 @@ Output:
                 # Preserve user/current values first, then append unique AI suggestions.
                 merged = list(old_vals)
                 if field == "subject":
-                    appended = self._dedupe_subject_candidates(new_vals, existing=merged, limit=max(0, 3 - len(merged)))
+                    appended = self._dedupe_subject_candidates(new_vals, existing=merged, limit=max(0, cap - len(merged)))
                     merged.extend(appended)
                 else:
                     seen = {v.lower() for v in merged}
@@ -810,11 +838,11 @@ Output:
                             continue
                         merged.append(candidate)
                         seen.add(key)
-                        if len(merged) >= 3:
+                        if len(merged) >= cap:
                             break
-                result[field] = merged[:3]
+                result[field] = merged[:cap]
             else:
-                result[field] = new_vals
+                result[field] = new_vals[:cap]
         return result
 
     def mix_and_create(self, description, rag_ideas, user_instruction=None, selected_keywords=None, field_inputs=None, concept_model: Optional[str] = None):
