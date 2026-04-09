@@ -48,6 +48,8 @@ class CreativeAgent:
         print("Initializing Creative Agent...")
         self.rag = RAGSystem()
         self.rag.initialize()
+        self.concept_timeout_seconds = int(os.getenv("FAST_TRACK_CONCEPT_TIMEOUT_SECONDS", "120"))
+        self.concept_max_retries = int(os.getenv("FAST_TRACK_CONCEPT_MAX_RETRIES", "1"))
 
         from langchain_google_genai import ChatGoogleGenerativeAI
         self.default_vision_model = "gemini-3-pro-preview"
@@ -90,13 +92,26 @@ class CreativeAgent:
         if model_name in self._creative_llm_cache:
             return self._creative_llm_cache[model_name], model_name
 
+        common_kwargs: Dict[str, Any] = {"temperature": 0.3}
+        if self.concept_timeout_seconds > 0:
+            common_kwargs["timeout"] = self.concept_timeout_seconds
+        if self.concept_max_retries >= 0:
+            common_kwargs["max_retries"] = self.concept_max_retries
+
         if model_name.startswith("gemini-"):
             from langchain_google_genai import ChatGoogleGenerativeAI
-            llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.3)
+            try:
+                llm = ChatGoogleGenerativeAI(model=model_name, **common_kwargs)
+            except TypeError:
+                # Compatibility fallback for older provider wrappers.
+                llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.3)
         elif model_name.startswith("gpt-"):
             if not os.getenv("OPENAI_API_KEY"):
                 raise ValueError("OPENAI_API_KEY is required for GPT concept models.")
-            llm = ChatOpenAI(model=model_name, temperature=0.3)
+            try:
+                llm = ChatOpenAI(model=model_name, **common_kwargs)
+            except TypeError:
+                llm = ChatOpenAI(model=model_name, temperature=0.3)
         else:
             raise ValueError(f"Cannot resolve provider for concept model '{model_name}'.")
 
@@ -1220,6 +1235,10 @@ Output ONLY valid JSON. Do not wrap it in markdown blocks. Just return the raw J
   }
 }
 """
+                print(
+                    f"[iter_concepts][full] requesting focus={focus_name} "
+                    f"model={resolved_model} timeout={self.concept_timeout_seconds}s"
+                )
                 response = creative_llm.invoke([HumanMessage(content=prompt)])
                 
                 raw_text = response.content
@@ -1357,6 +1376,11 @@ Rules:
 
                     for attempt in range(1, max_attempts + 1):
                         prompt_with_feedback_call = prompt_with_feedback + '\nCRITICAL REQUIREMENT: Output ONLY valid JSON representing the response. Do not wrap it in markdown blocks. Just return the raw JSON object: { "title": "...", "visual_prompt": "...", "visual_prompt_json": {...}, "caption": "...", "logic": "..." }'
+                        print(
+                            f"[iter_concepts][smart] requesting {gi + 1}.{si + 1} "
+                            f"attempt={attempt}/{max_attempts} model={resolved_model} "
+                            f"timeout={self.concept_timeout_seconds}s"
+                        )
                         response = creative_llm.invoke([HumanMessage(content=prompt_with_feedback_call)])
                         
                         raw_text = response.content
