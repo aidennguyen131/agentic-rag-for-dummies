@@ -1164,7 +1164,19 @@ User provided field values (prioritize these):
 - Context: {normalized_fields['context']}
 """
 
-            focus_specs = [
+            # Fields the user explicitly provided (even with 1 value) → lock them,
+            # don't use them as a focus dimension so we don't explore what's already fixed.
+            _user_provided = {k for k, v in normalized_fields.items() if v}
+            # Map focus_key → normalized_fields key (art_style ↔ style)
+            _focus_key_to_norm = {
+                "subject": "subject",
+                "action": "action",
+                "context": "context",
+                "mood": "mood",
+                "art_style": "style",
+                "colors": "colors",
+            }
+            all_focus_specs = [
                 ("Subject", "subject"),
                 ("Action", "action"),
                 ("Context", "context"),
@@ -1172,12 +1184,22 @@ User provided field values (prioritize these):
                 ("Style", "art_style"),
                 ("Color", "colors"),
             ]
+            focus_specs = [
+                (fname, fkey)
+                for fname, fkey in all_focus_specs
+                if _focus_key_to_norm.get(fkey, fkey) not in _user_provided
+            ]
+            # Always explore at least 1 dimension
+            if not focus_specs:
+                focus_specs = all_focus_specs[:1]
+
+            print(f"[iter_concepts][full] user_provided={_user_provided} → {len(focus_specs)} focus groups")
 
             # Yield metadata first
             yield {
                 "_meta": True,
                 "mode": "full",
-                "total": 6,
+                "total": len(focus_specs),
                 "groups_info": [{"focus": f[0], "cards": 3} for f in focus_specs],
             }
 
