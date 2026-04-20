@@ -421,7 +421,19 @@ Required fields:
 1. "visual_prompt":
    - A long, detailed, cohesive text-to-image prompt.
    - Describe subject, action, scene, style, materials, lighting, composition, textures, colors, mood, and rendering details.
-2. "prompt_json":
+2. "subject":
+   - Concise primary subject/focal character or object.
+3. "action":
+   - Concise pose, activity, motion, or visual verb.
+4. "mood":
+   - Concise emotional tone.
+5. "context":
+   - Concise setting, environment, or scene context.
+6. "art_style":
+   - Concise visual style / medium / rendering family.
+7. "colors":
+   - Concise dominant palette as a comma-separated string.
+8. "prompt_json":
    - A deeply structured JSON object for generation.
    - Include nested keys where useful: subject, environment, composition, style, color_palette, lighting, camera, materials, texture, typography, effects, constraints, print_notes.
 
@@ -484,6 +496,15 @@ Output format rules:
                 "visual_prompt": text_content,
                 "prompt_json": {}
             }
+
+        if isinstance(payload, dict):
+            # Keep the dynamic prompt package, but also expose the stable top-level
+            # fields consumed by Single Generation, Batch Mix, FastTrack, and stats.
+            for field in ["subject", "action", "mood", "context", "art_style", "colors"]:
+                if not str(payload.get(field, "") or "").strip():
+                    value = self._get_vision_field_value(payload, field)
+                    if value:
+                        payload[field] = value
 
         # Provide raw debugging text to frontend
         payload["__raw_debug_json"] = text_content
