@@ -48,7 +48,7 @@ class CreativeAgent:
         print("Initializing Creative Agent...")
         self.rag = RAGSystem()
         self.rag.initialize()
-        self.concept_timeout_seconds = int(os.getenv("FAST_TRACK_CONCEPT_TIMEOUT_SECONDS", "120"))
+        self.concept_timeout_seconds = int(os.getenv("FAST_TRACK_CONCEPT_TIMEOUT_SECONDS", "300"))
         self.concept_max_retries = int(os.getenv("FAST_TRACK_CONCEPT_MAX_RETRIES", "1"))
 
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -1225,7 +1225,8 @@ User provided field values (prioritize these):
             }
 
             for focus_name, focus_key in focus_specs:
-                prompt = f"""
+                try:
+                    prompt = f"""
 You are a Creative Director for POD T-shirt concepts.
 
 Original image analysis:
@@ -1256,10 +1257,10 @@ Rules:
 - visual_prompt_json must be a dynamic JSON prompt object with any creative fields useful for image generation; keep it coherent with visual_prompt.
 - focus must be exactly "{focus_name}".
 """
-                if user_instruction:
-                    prompt += f'\nUser instruction to honor: "{user_instruction}"\n'
+                    if user_instruction:
+                        prompt += f'\nUser instruction to honor: "{user_instruction}"\n'
 
-                prompt += """
+                    prompt += """
 Output ONLY valid JSON. Do not wrap it in markdown blocks. Just return the raw JSON object.
 {
   "concept": {
@@ -1278,53 +1279,56 @@ Output ONLY valid JSON. Do not wrap it in markdown blocks. Just return the raw J
   }
 }
 """
-                print(
-                    f"[iter_concepts][full] requesting focus={focus_name} "
-                    f"model={resolved_model} timeout={self.concept_timeout_seconds}s"
-                )
-                response = creative_llm.invoke([HumanMessage(content=prompt)])
-                
-                raw_text = response.content
-                if isinstance(raw_text, list):
-                    texts = [part.get("text", "") for part in raw_text if isinstance(part, dict) and "text" in part]
-                    raw_text = "".join(texts).strip()
-                    if not raw_text:
-                        raw_text = "".join([str(p) for p in response.content if isinstance(p, str)]).strip()
-                else:
-                    raw_text = str(raw_text).strip()
+                    print(
+                        f"[iter_concepts][full] requesting focus={focus_name} "
+                        f"model={resolved_model} timeout={self.concept_timeout_seconds}s"
+                    )
+                    response = creative_llm.invoke([HumanMessage(content=prompt)])
+                    
+                    raw_text = response.content
+                    if isinstance(raw_text, list):
+                        texts = [part.get("text", "") for part in raw_text if isinstance(part, dict) and "text" in part]
+                        raw_text = "".join(texts).strip()
+                        if not raw_text:
+                            raw_text = "".join([str(p) for p in response.content if isinstance(p, str)]).strip()
+                    else:
+                        raw_text = str(raw_text).strip()
 
-                if raw_text.startswith("```json"):
-                    raw_text = raw_text[7:]
-                elif raw_text.startswith("```"):
-                    raw_text = raw_text[3:]
-                if raw_text.endswith("```"):
-                    raw_text = raw_text[:-3]
-                raw_text = raw_text.strip()
-                
-                try:
-                    payload = json.loads(raw_text)
-                    concept_dict = payload.get("concept", payload)
+                    if raw_text.startswith("```json"):
+                        raw_text = raw_text[7:]
+                    elif raw_text.startswith("```"):
+                        raw_text = raw_text[3:]
+                    if raw_text.endswith("```"):
+                        raw_text = raw_text[:-3]
+                    raw_text = raw_text.strip()
+                    
+                    try:
+                        payload = json.loads(raw_text)
+                        concept_dict = payload.get("concept", payload)
+                    except Exception as e:
+                        print(f"[iter_concepts] Failed to parse JSON: {e}")
+                        concept_dict = {
+                            "title": "Failed to parse",
+                            "visual_prompt": raw_text,
+                            "visual_prompt_json": {},
+                            "subject": [baseline.get("subject", "")],
+                            "action": [baseline.get("action", "")],
+                            "context": [baseline.get("context", "")],
+                            "mood": [baseline.get("mood", "")],
+                            "art_style": [baseline.get("art_style", "")],
+                            "colors": [baseline.get("colors", "")],
+                            "caption": "",
+                            "logic": "",
+                            "focus": focus_name
+                        }
+
+                    concept_dict = self._coerce_concept_shape(concept_dict, focus_name, baseline)
+                    concept_dict["__raw_debug_json"] = raw_text
+                    concept_dict["mode"] = "full"
+                    yield concept_dict
                 except Exception as e:
-                    print(f"[iter_concepts] Failed to parse JSON: {e}")
-                    concept_dict = {
-                        "title": "Failed to parse",
-                        "visual_prompt": raw_text,
-                        "visual_prompt_json": {},
-                        "subject": [baseline.get("subject", "")],
-                        "action": [baseline.get("action", "")],
-                        "context": [baseline.get("context", "")],
-                        "mood": [baseline.get("mood", "")],
-                        "art_style": [baseline.get("art_style", "")],
-                        "colors": [baseline.get("colors", "")],
-                        "caption": "",
-                        "logic": "",
-                        "focus": focus_name
-                    }
-
-                concept_dict = self._coerce_concept_shape(concept_dict, focus_name, baseline)
-                concept_dict["__raw_debug_json"] = raw_text
-                concept_dict["mode"] = "full"
-                yield concept_dict
+                    print(f"[iter_concepts][full] Error in group {focus_name}: {e}")
+                    continue
 
         # ════════════════════════════════════════════════════════════
         #  MODE B: Smart mode (Cartesian combos, grouped)
@@ -1370,16 +1374,17 @@ Output ONLY valid JSON. Do not wrap it in markdown blocks. Just return the raw J
                 # Build sub-cards for this group
                 sub_cards = []
                 for si, combo in enumerate(group["combos"]):
-                    # Map field_inputs keys to concept keys
-                    concept_fields = {}
-                    for fk, ck in field_key_to_concept.items():
-                        concept_fields[ck] = combo.get(fk, locked.get(fk, ""))
+                    try:
+                        # Map field_inputs keys to concept keys
+                        concept_fields = {}
+                        for fk, ck in field_key_to_concept.items():
+                            concept_fields[ck] = combo.get(fk, locked.get(fk, ""))
 
-                    # AI generates title + visual_prompt for this combo
-                    combo_desc = ", ".join([
-                        f"{k}: {v}" for k, v in concept_fields.items() if v
-                    ])
-                    prompt = f"""
+                        # AI generates title + visual_prompt for this combo
+                        combo_desc = ", ".join([
+                            f"{k}: {v}" for k, v in concept_fields.items() if v
+                        ])
+                        prompt = f"""
 You are a Creative Director for POD T-shirt concepts.
 
 Original image analysis:
@@ -1402,116 +1407,123 @@ FIELD VALUES:
 Rules:
 - visual_prompt must be detailed, cohesive, and print-on-demand ready.
 - Include composition, lighting, texture hints.
-- STRICT minimum length: visual_prompt MUST be at least 800 words.
+- STRICT minimum length: visual_prompt MUST be at least 400 words.
 - visual_prompt_json must be a dynamic JSON prompt object tailored to this combo; include any creative structured fields that help image generation; keep it coherent with visual_prompt.
 - Title should be catchy and commercial.
 - Explain briefly why this combo works in 'logic'.
 """
-                    if user_instruction:
-                        prompt += f'\nUser instruction to honor: "{user_instruction}"\n'
+                        if user_instruction:
+                            prompt += f'\nUser instruction to honor: "{user_instruction}"\n'
 
-                    min_words = 800
-                    max_attempts = 3
-                    smart_result: Dict[str, Any] = {}
-                    visual_prompt_text = ""
-                    visual_prompt_words = 0
-                    prompt_with_feedback = prompt
+                        min_words = 400
+                        max_attempts = 3
+                        smart_result: Dict[str, Any] = {}
+                        visual_prompt_text = ""
+                        visual_prompt_words = 0
+                        prompt_with_feedback = prompt
 
-                    for attempt in range(1, max_attempts + 1):
-                        prompt_with_feedback_call = prompt_with_feedback + '\nCRITICAL REQUIREMENT: Output ONLY valid JSON representing the response. Do not wrap it in markdown blocks. Just return the raw JSON object: { "title": "...", "visual_prompt": "...", "visual_prompt_json": {...}, "caption": "...", "logic": "..." }'
-                        print(
-                            f"[iter_concepts][smart] requesting {gi + 1}.{si + 1} "
-                            f"attempt={attempt}/{max_attempts} model={resolved_model} "
-                            f"timeout={self.concept_timeout_seconds}s"
-                        )
-                        response = creative_llm.invoke([HumanMessage(content=prompt_with_feedback_call)])
-                        
-                        raw_text = response.content
-                        if isinstance(raw_text, list):
-                            texts = [part.get("text", "") for part in raw_text if isinstance(part, dict) and "text" in part]
-                            raw_text = "".join(texts).strip()
-                            if not raw_text:
-                                raw_text = "".join([str(p) for p in response.content if isinstance(p, str)]).strip()
+                        for attempt in range(1, max_attempts + 1):
+                            prompt_with_feedback_call = prompt_with_feedback + '\nCRITICAL REQUIREMENT: Output ONLY valid JSON representing the response. Do not wrap it in markdown blocks. Just return the raw JSON object: { "title": "...", "visual_prompt": "...", "visual_prompt_json": {...}, "caption": "...", "logic": "..." }'
+                            print(
+                                f"[iter_concepts][smart] requesting {gi + 1}.{si + 1} "
+                                f"attempt={attempt}/{max_attempts} model={resolved_model} "
+                                f"timeout={self.concept_timeout_seconds}s"
+                            )
+                            response = creative_llm.invoke([HumanMessage(content=prompt_with_feedback_call)])
+                            
+                            raw_text = response.content
+                            if isinstance(raw_text, list):
+                                texts = [part.get("text", "") for part in raw_text if isinstance(part, dict) and "text" in part]
+                                raw_text = "".join(texts).strip()
+                                if not raw_text:
+                                    raw_text = "".join([str(p) for p in response.content if isinstance(p, str)]).strip()
+                            else:
+                                raw_text = str(raw_text).strip()
+
+                            if raw_text.startswith("```json"):
+                                raw_text = raw_text[7:]
+                            elif raw_text.startswith("```"):
+                                raw_text = raw_text[3:]
+                            if raw_text.endswith("```"):
+                                raw_text = raw_text[:-3]
+                            raw_text = raw_text.strip()
+                            
+                            try:
+                                smart_result = json.loads(raw_text)
+                            except Exception as e:
+                                print(f"[iter_concepts][smart] JSON parsing failed: {e}")
+                                smart_result = {"visual_prompt": raw_text, "visual_prompt_json": {}}
+
+                            smart_result["__raw_debug_json"] = raw_text
+                            visual_prompt_text = str(smart_result.get("visual_prompt", "") or "").strip()
+                            visual_prompt_words = self._count_words(visual_prompt_text)
+                            print(
+                                f"[iter_concepts][smart] {gi + 1}.{si + 1} "
+                                f"words={visual_prompt_words} attempt={attempt}/{max_attempts}"
+                            )
+                            if visual_prompt_words >= min_words:
+                                break
+
+                            prompt_with_feedback = (
+                                f"{prompt}\n\n"
+                                f"LENGTH REVISION (attempt {attempt}):\n"
+                                f"- Your previous visual_prompt had {visual_prompt_words} words.\n"
+                                f"- Rewrite ONLY visual_prompt so it has at least {min_words} words.\n"
+                                f"- Keep all field values and stylistic intent unchanged.\n"
+                                f"- Return the full JSON object again with title, visual_prompt, visual_prompt_json, caption, logic."
+                            )
+
+                        if visual_prompt_words < min_words:
+                            smart_result["visual_prompt"] = self._expand_prompt_to_min_words(
+                                visual_prompt_text,
+                                concept_fields=concept_fields,
+                                min_words=min_words,
+                            )
+                            visual_prompt_words = self._count_words(smart_result["visual_prompt"])
+                            print(
+                                f"[iter_concepts][smart] {gi + 1}.{si + 1} "
+                                f"fallback_expand_applied words={visual_prompt_words}"
+                            )
+
+                        prompt_json = self._coerce_prompt_json_object(smart_result.get("visual_prompt_json", {}))
+                        if not prompt_json:
+                            prompt_json = self._build_prompt_json_from_concept_fields(
+                                concept_fields,
+                                visual_prompt_text=str(smart_result.get("visual_prompt", "") or ""),
+                            )
                         else:
-                            raw_text = str(raw_text).strip()
+                            prompt_json = self._merge_pod_visual_prompt_json(prompt_json)
 
-                        if raw_text.startswith("```json"):
-                            raw_text = raw_text[7:]
-                        elif raw_text.startswith("```"):
-                            raw_text = raw_text[3:]
-                        if raw_text.endswith("```"):
-                            raw_text = raw_text[:-3]
-                        raw_text = raw_text.strip()
-                        
-                        try:
-                            smart_result = json.loads(raw_text)
-                        except Exception as e:
-                            print(f"[iter_concepts][smart] JSON parsing failed: {e}")
-                            smart_result = {"visual_prompt": raw_text, "visual_prompt_json": {}}
+                        sub_card = {
+                            "sub_label": f"{gi + 1}.{si + 1}",
+                            "title": smart_result.get("title", ""),
+                            "visual_prompt": smart_result.get("visual_prompt", ""),
+                            "visual_prompt_json": prompt_json,
+                            "caption": smart_result.get("caption", ""),
+                            "logic": smart_result.get("logic", ""),
+                            "__raw_debug_json": smart_result.get("__raw_debug_json", ""),
+                            **concept_fields,
+                        }
+                        sub_cards.append(sub_card)
 
-                        smart_result["__raw_debug_json"] = raw_text
-                        visual_prompt_text = str(smart_result.get("visual_prompt", "") or "").strip()
-                        visual_prompt_words = self._count_words(visual_prompt_text)
-                        print(
-                            f"[iter_concepts][smart] {gi + 1}.{si + 1} "
-                            f"words={visual_prompt_words} attempt={attempt}/{max_attempts}"
-                        )
-                        if visual_prompt_words >= min_words:
-                            break
+                        # Progressive streaming: emit each sub-card as soon as it is ready so the UI can render 1.1, then 1.2, etc.
+                        yield {
+                            "_streaming_partial": True,
+                            "mode": "smart",
+                            "group_index": gi + 1,
+                            "group_value": group["group_value"],
+                            "primary_focus_name": primary_focus_name,
+                            "sub_index": si + 1,
+                            "subs_in_group": len(group["combos"]),
+                            "sub_card": sub_card,
+                        }
+                    except Exception as e:
+                        print(f"[iter_concepts][smart] Error in sub-card {gi + 1}.{si + 1}: {e}")
+                        continue
 
-                        prompt_with_feedback = (
-                            f"{prompt}\n\n"
-                            f"LENGTH REVISION (attempt {attempt}):\n"
-                            f"- Your previous visual_prompt had {visual_prompt_words} words.\n"
-                            f"- Rewrite ONLY visual_prompt so it has at least {min_words} words.\n"
-                            f"- Keep all field values and stylistic intent unchanged.\n"
-                            f"- Return the full JSON object again with title, visual_prompt, visual_prompt_json, caption, logic."
-                        )
-
-                    if visual_prompt_words < min_words:
-                        smart_result["visual_prompt"] = self._expand_prompt_to_min_words(
-                            visual_prompt_text,
-                            concept_fields=concept_fields,
-                            min_words=min_words,
-                        )
-                        visual_prompt_words = self._count_words(smart_result["visual_prompt"])
-                        print(
-                            f"[iter_concepts][smart] {gi + 1}.{si + 1} "
-                            f"fallback_expand_applied words={visual_prompt_words}"
-                        )
-
-                    prompt_json = self._coerce_prompt_json_object(smart_result.get("visual_prompt_json", {}))
-                    if not prompt_json:
-                        prompt_json = self._build_prompt_json_from_concept_fields(
-                            concept_fields,
-                            visual_prompt_text=str(smart_result.get("visual_prompt", "") or ""),
-                        )
-                    else:
-                        prompt_json = self._merge_pod_visual_prompt_json(prompt_json)
-
-                    sub_card = {
-                        "sub_label": f"{gi + 1}.{si + 1}",
-                        "title": smart_result.get("title", ""),
-                        "visual_prompt": smart_result.get("visual_prompt", ""),
-                        "visual_prompt_json": prompt_json,
-                        "caption": smart_result.get("caption", ""),
-                        "logic": smart_result.get("logic", ""),
-                        "__raw_debug_json": smart_result.get("__raw_debug_json", ""),
-                        **concept_fields,
-                    }
-                    sub_cards.append(sub_card)
-
-                    # Progressive streaming: emit each sub-card as soon as it is ready so the UI can render 1.1, then 1.2, etc.
-                    yield {
-                        "_streaming_partial": True,
-                        "mode": "smart",
-                        "group_index": gi + 1,
-                        "group_value": group["group_value"],
-                        "primary_focus_name": primary_focus_name,
-                        "sub_index": si + 1,
-                        "subs_in_group": len(group["combos"]),
-                        "sub_card": sub_card,
-                    }
+                if not sub_cards:
+                    print(f"[iter_concepts][smart] All sub-cards failed for group {group.get('group_value')}, skipping.")
+                    continue
 
                 # Build concept dict compatible with frontend
                 # Focus field gets all values from this group's combos
