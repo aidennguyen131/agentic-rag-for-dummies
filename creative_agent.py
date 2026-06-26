@@ -52,11 +52,11 @@ class CreativeAgent:
         self.concept_max_retries = int(os.getenv("FAST_TRACK_CONCEPT_MAX_RETRIES", "1"))
 
         from langchain_google_genai import ChatGoogleGenerativeAI
-        self.default_vision_model = "gemini-3-pro-preview"
-        self.default_concept_model = "gemini-3-pro-preview"
+        self.default_vision_model = "gemini-pro-latest"
+        self.default_concept_model = "gemini-pro-latest"
         self._creative_model_aliases = {
-            "gemini-3-pro-preview": "gemini-3-pro-preview",
-            "gemini 3 pro preview": "gemini-3-pro-preview",
+            "gemini-pro-latest": "gemini-pro-latest",
+            "gemini pro latest": "gemini-pro-latest",
             "gemini-3-flash-preview": "gemini-3-flash-preview",
             "gemini-3-flash": "gemini-3-flash-preview",
             "gemini 3 flash": "gemini-3-flash-preview",
@@ -66,7 +66,7 @@ class CreativeAgent:
             "gpt 5 mini": "gpt-5-mini",
         }
         self._allowed_concept_models = {
-            "gemini-3-pro-preview",
+            "gemini-pro-latest",
             "gemini-3-flash-preview",
             "gpt-5.2",
             "gpt-5-mini",
