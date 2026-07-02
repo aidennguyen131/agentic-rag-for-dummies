@@ -52,8 +52,10 @@ class CreativeAgent:
         self.concept_max_retries = int(os.getenv("FAST_TRACK_CONCEPT_MAX_RETRIES", "1"))
 
         from langchain_google_genai import ChatGoogleGenerativeAI
-        self.default_vision_model = "gemini-3-flash-preview"
-        self.default_concept_model = "gemini-3-flash-preview"
+        self.default_vision_model = str(os.getenv("CREATIVE_AGENT_VISION_MODEL") or "gemini-pro-latest").strip()
+        self.default_concept_model = str(
+            os.getenv("CREATIVE_AGENT_CONCEPT_MODEL") or self.default_vision_model
+        ).strip()
         self._creative_model_aliases = {
             "gemini-pro-latest": "gemini-pro-latest",
             "gemini pro latest": "gemini-pro-latest",
