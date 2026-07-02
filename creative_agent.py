@@ -52,8 +52,8 @@ class CreativeAgent:
         self.concept_max_retries = int(os.getenv("FAST_TRACK_CONCEPT_MAX_RETRIES", "1"))
 
         from langchain_google_genai import ChatGoogleGenerativeAI
-        self.default_vision_model = "gemini-pro-latest"
-        self.default_concept_model = "gemini-pro-latest"
+        self.default_vision_model = "gemini-3-flash-preview"
+        self.default_concept_model = "gemini-3-flash-preview"
         self._creative_model_aliases = {
             "gemini-pro-latest": "gemini-pro-latest",
             "gemini pro latest": "gemini-pro-latest",
@@ -73,7 +73,7 @@ class CreativeAgent:
         }
         self._creative_llm_cache = {}
 
-        # Vision analysis remains fixed on Gemini Pro.
+        # Vision analysis remains fixed on the configured Gemini vision default.
         self.vision_llm = ChatGoogleGenerativeAI(model=self.default_vision_model, max_tokens=10000)
         self.creative_llm, _ = self._get_creative_llm(self.default_concept_model)
 
