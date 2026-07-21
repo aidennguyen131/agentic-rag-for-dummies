@@ -51,10 +51,28 @@ class CreativeAgent:
         self.concept_timeout_seconds = int(os.getenv("FAST_TRACK_CONCEPT_TIMEOUT_SECONDS", "300"))
         self.concept_max_retries = int(os.getenv("FAST_TRACK_CONCEPT_MAX_RETRIES", "1"))
 
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        self.default_vision_model = str(os.getenv("CREATIVE_AGENT_VISION_MODEL") or "gemini-3-flash-preview").strip()
+        shared_provider = self._normalize_provider(os.getenv("CREATIVE_AGENT_PROVIDER") or "cliproxy")
+        self.vision_provider = self._normalize_provider(
+            os.getenv("CREATIVE_AGENT_VISION_PROVIDER") or shared_provider
+        )
+        self.concept_provider = self._normalize_provider(
+            os.getenv("CREATIVE_AGENT_CONCEPT_PROVIDER") or shared_provider
+        )
+        default_vision_model = (
+            "gemini-3-flash"
+            if self.vision_provider == "cliproxy"
+            else "gemini-3-flash-preview"
+        )
+        self.default_vision_model = str(
+            os.getenv("CREATIVE_AGENT_VISION_MODEL") or default_vision_model
+        ).strip()
+        default_concept_model = (
+            "gemini-pro-agent"
+            if self.concept_provider == "cliproxy"
+            else "gemini-pro-latest"
+        )
         self.default_concept_model = str(
-            os.getenv("CREATIVE_AGENT_CONCEPT_MODEL") or self.default_vision_model
+            os.getenv("CREATIVE_AGENT_CONCEPT_MODEL") or default_concept_model
         ).strip()
         self._creative_model_aliases = {
             "gemini-pro-latest": "gemini-pro-latest",
@@ -62,6 +80,8 @@ class CreativeAgent:
             "gemini-3-flash-preview": "gemini-3-flash-preview",
             "gemini-3-flash": "gemini-3-flash-preview",
             "gemini 3 flash": "gemini-3-flash-preview",
+            "gemini-pro-agent": "gemini-pro-agent",
+            "gemini pro agent": "gemini-pro-agent",
             "gpt-5.2": "gpt-5.2",
             "gpt 5.2": "gpt-5.2",
             "gpt-5-mini": "gpt-5-mini",
@@ -70,19 +90,101 @@ class CreativeAgent:
         self._allowed_concept_models = {
             "gemini-pro-latest",
             "gemini-3-flash-preview",
+            "gemini-3-flash",
+            "gemini-pro-agent",
             "gpt-5.2",
             "gpt-5-mini",
         }
         self._creative_llm_cache = {}
 
-        # Vision analysis remains fixed on the configured Gemini vision default.
-        self.vision_llm = ChatGoogleGenerativeAI(model=self.default_vision_model, max_tokens=10000)
+        self.vision_llm = self._build_llm(
+            provider=self.vision_provider,
+            model_name=self.default_vision_model,
+            max_tokens=10000,
+        )
         self.creative_llm, _ = self._get_creative_llm(self.default_concept_model)
+        print(
+            "Creative Agent configured: "
+            f"vision={self.vision_provider}/{self.default_vision_model}, "
+            f"concept={self.concept_provider}/{self.default_concept_model}"
+        )
+
+    @staticmethod
+    def _normalize_provider(provider: Optional[str]) -> str:
+        normalized = str(provider or "").strip().lower().replace("-", "_")
+        if normalized in {"cliproxy", "cli_proxy", "proxy"}:
+            return "cliproxy"
+        if normalized in {"google", "google_direct", "gemini", "direct"}:
+            return "google_direct"
+        raise ValueError(
+            f"Unsupported Creative Agent provider '{provider}'. Allowed: google_direct, cliproxy"
+        )
+
+    def _build_llm(
+        self,
+        *,
+        provider: str,
+        model_name: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[int] = None,
+        max_retries: Optional[int] = None,
+    ):
+        kwargs: Dict[str, Any] = {}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        if timeout is not None and timeout > 0:
+            kwargs["timeout"] = timeout
+        if max_retries is not None and max_retries >= 0:
+            kwargs["max_retries"] = max_retries
+
+        if provider == "cliproxy":
+            api_key = str(os.getenv("CLIPROXY_API_KEY") or "").strip()
+            base_url = str(os.getenv("CLIPROXY_BASE_URL") or "").strip().rstrip("/")
+            if not api_key or not base_url:
+                raise ValueError(
+                    "CLIPROXY_API_KEY and CLIPROXY_BASE_URL are required for the Cliproxy Creative Agent provider."
+                )
+            return ChatOpenAI(
+                model=model_name,
+                api_key=api_key,
+                base_url=base_url,
+                **kwargs,
+            )
+
+        # BACKUP — direct Google Gemini implementation (disabled while Cliproxy is primary).
+        # To restore it, uncomment this block and set CREATIVE_AGENT_PROVIDER=google_direct.
+        # if provider == "google_direct" and model_name.startswith("gemini-"):
+        #     from langchain_google_genai import ChatGoogleGenerativeAI
+        #     return ChatGoogleGenerativeAI(model=model_name, **kwargs)
+        if provider == "google_direct" and model_name.startswith("gemini-"):
+            raise ValueError(
+                "Direct Google Gemini is disabled. Use CREATIVE_AGENT_PROVIDER=cliproxy, "
+                "or restore the commented backup block in CreativeAgent._build_llm()."
+            )
+        if model_name.startswith("gpt-"):
+            if not os.getenv("OPENAI_API_KEY"):
+                raise ValueError("OPENAI_API_KEY is required for GPT concept models.")
+            return ChatOpenAI(model=model_name, **kwargs)
+        raise ValueError(f"Cannot resolve direct provider for model '{model_name}'.")
 
     def _normalize_concept_model(self, concept_model: Optional[str]) -> str:
         raw = str(concept_model or "").strip()
         if not raw:
             return self.default_concept_model
+        if self.concept_provider == "cliproxy":
+            proxy_aliases = {
+                "gemini-pro-latest": "gemini-pro-agent",
+                "gemini pro latest": "gemini-pro-agent",
+                "gemini-3-flash-preview": "gemini-3-flash",
+                "gemini-3-flash": "gemini-3-flash",
+                "gemini 3 flash": "gemini-3-flash",
+            }
+            proxy_model = proxy_aliases.get(raw.lower())
+            if proxy_model:
+                return proxy_model
         canonical = self._creative_model_aliases.get(raw.lower(), raw)
         if canonical not in self._allowed_concept_models:
             allowed = ", ".join(sorted(self._allowed_concept_models))
@@ -94,28 +196,21 @@ class CreativeAgent:
         if model_name in self._creative_llm_cache:
             return self._creative_llm_cache[model_name], model_name
 
-        common_kwargs: Dict[str, Any] = {"temperature": 0.3}
-        if self.concept_timeout_seconds > 0:
-            common_kwargs["timeout"] = self.concept_timeout_seconds
-        if self.concept_max_retries >= 0:
-            common_kwargs["max_retries"] = self.concept_max_retries
-
-        if model_name.startswith("gemini-"):
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            try:
-                llm = ChatGoogleGenerativeAI(model=model_name, **common_kwargs)
-            except TypeError:
-                # Compatibility fallback for older provider wrappers.
-                llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.3)
-        elif model_name.startswith("gpt-"):
-            if not os.getenv("OPENAI_API_KEY"):
-                raise ValueError("OPENAI_API_KEY is required for GPT concept models.")
-            try:
-                llm = ChatOpenAI(model=model_name, **common_kwargs)
-            except TypeError:
-                llm = ChatOpenAI(model=model_name, temperature=0.3)
-        else:
-            raise ValueError(f"Cannot resolve provider for concept model '{model_name}'.")
+        try:
+            llm = self._build_llm(
+                provider=self.concept_provider,
+                model_name=model_name,
+                temperature=0.3,
+                timeout=self.concept_timeout_seconds,
+                max_retries=self.concept_max_retries,
+            )
+        except TypeError:
+            # Compatibility fallback for older provider wrappers.
+            llm = self._build_llm(
+                provider=self.concept_provider,
+                model_name=model_name,
+                temperature=0.3,
+            )
 
         self._creative_llm_cache[model_name] = llm
         return llm, model_name
@@ -408,7 +503,10 @@ class CreativeAgent:
         return ""
 
     def analyze_image(self, image_path):
-        print(f"Analyzing image: {image_path}...")
+        print(
+            f"Analyzing image: {image_path} "
+            f"with {self.vision_provider}/{self.default_vision_model}..."
+        )
 
         image_data_url = self.encode_image(image_path)
         
