@@ -1248,11 +1248,128 @@ Use these as hard constraints:
         field_inputs: Optional[Dict[str, List[str]]] = None,
         vision_analysis: Optional[Dict] = None,
         concept_model: Optional[str] = None,
+        single_card: bool = False,
     ):
         pass
 
         normalized_fields = self._normalize_field_inputs(field_inputs)
         baseline = self._extract_baseline_fields(description, vision_analysis, normalized_fields)
+        creative_llm, resolved_model = self._get_creative_llm(concept_model)
+        print(f"Streaming concept model: {resolved_model}")
+
+        if single_card:
+            yield {
+                "_meta": True,
+                "mode": "single",
+                "total": 1,
+                "total_cards": 1,
+                "primary_field": "",
+                "changed_fields": [],
+                "groups_info": [{"focus": "Single", "cards": 1}],
+            }
+
+            prompt = f"""
+You are a Creative Director for POD T-shirt concepts.
+
+Original image analysis:
+{description}
+
+RAG inspiration:
+{rag_ideas}
+
+Generate exactly ONE highly detailed, print-on-demand ready T-shirt concept using these field values:
+
+FIELD VALUES:
+- subject: {baseline.get('subject', '')}
+- action: {baseline.get('action', '')}
+- context: {baseline.get('context', '')}
+- mood: {baseline.get('mood', '')}
+- art_style: {baseline.get('art_style', '')}
+- colors: {baseline.get('colors', '')}
+
+Rules:
+- Do not create alternates or variants.
+- Keep the concept coherent with the original image analysis.
+- visual_prompt must be detailed, cohesive, and print-on-demand ready.
+- Include composition, lighting, texture hints.
+- visual_prompt_json must be a dynamic JSON prompt object tailored to this concept.
+- Title should be catchy and commercial.
+- Explain briefly why this concept works in 'logic'.
+"""
+            if user_instruction:
+                prompt += f'\nUser instruction to honor: "{user_instruction}"\n'
+            prompt += '\nCRITICAL REQUIREMENT: Output ONLY valid JSON. Do not wrap it in markdown blocks. Just return the raw JSON object: { "title": "...", "visual_prompt": "...", "visual_prompt_json": {...}, "caption": "...", "logic": "..." }'
+
+            response = creative_llm.invoke([HumanMessage(content=prompt)])
+            raw_text = response.content
+            if isinstance(raw_text, list):
+                texts = [part.get("text", "") for part in raw_text if isinstance(part, dict) and "text" in part]
+                raw_text = "".join(texts).strip()
+                if not raw_text:
+                    raw_text = "".join([str(p) for p in response.content if isinstance(p, str)]).strip()
+            else:
+                raw_text = str(raw_text).strip()
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:]
+            elif raw_text.startswith("```"):
+                raw_text = raw_text[3:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3]
+            raw_text = raw_text.strip()
+
+            try:
+                single_result = json.loads(raw_text)
+            except Exception as e:
+                print(f"[iter_concepts][single] JSON parsing failed: {e}")
+                single_result = {"visual_prompt": raw_text, "visual_prompt_json": {}}
+
+            concept_fields = {
+                "subject": baseline.get("subject", ""),
+                "action": baseline.get("action", ""),
+                "context": baseline.get("context", ""),
+                "mood": baseline.get("mood", ""),
+                "art_style": baseline.get("art_style", ""),
+                "colors": baseline.get("colors", ""),
+            }
+            visual_prompt = str(single_result.get("visual_prompt") or "").strip()
+            if not visual_prompt:
+                visual_prompt = (
+                    f"{concept_fields.get('art_style', '')} T-shirt design featuring "
+                    f"{concept_fields.get('subject', '')} {concept_fields.get('action', '')} "
+                    f"in {concept_fields.get('context', '')}, mood {concept_fields.get('mood', '')}, "
+                    f"colors {concept_fields.get('colors', '')}, POD ready."
+                ).strip()
+            prompt_json = self._coerce_prompt_json_object(single_result.get("visual_prompt_json", {}))
+            if not prompt_json:
+                prompt_json = self._build_prompt_json_from_concept_fields(
+                    concept_fields,
+                    visual_prompt_text=visual_prompt,
+                )
+            else:
+                prompt_json = self._merge_pod_visual_prompt_json(prompt_json)
+
+            sub_card = {
+                "sub_label": "1.1",
+                "title": str(single_result.get("title") or "").strip() or "Single FastTrack Concept",
+                "visual_prompt": visual_prompt,
+                "visual_prompt_json": prompt_json,
+                "caption": str(single_result.get("caption") or "").strip(),
+                "logic": str(single_result.get("logic") or "").strip(),
+                "__raw_debug_json": raw_text,
+                **concept_fields,
+            }
+            yield {
+                "title": sub_card["title"],
+                "visual_prompt": sub_card["visual_prompt"],
+                "visual_prompt_json": sub_card["visual_prompt_json"],
+                "caption": sub_card["caption"],
+                "logic": sub_card["logic"],
+                "focus": "Single",
+                "mode": "single",
+                "sub_cards": [sub_card],
+                **{key: [value] for key, value in concept_fields.items()},
+            }
+            return
 
         # ── Smart classification ──
         changed, locked = self._classify_fields(normalized_fields, vision_analysis)
@@ -1260,9 +1377,6 @@ Use these as hard constraints:
         use_full_exploration = (num_changed == 0)
 
         print(f"[iter_concepts] changed={list(changed.keys())} locked={list(locked.keys())} → mode={'full' if use_full_exploration else 'smart'}")
-
-        creative_llm, resolved_model = self._get_creative_llm(concept_model)
-        print(f"Streaming concept model: {resolved_model}")
 
         keywords_context = ""
         if selected_keywords and len(selected_keywords) > 0:
