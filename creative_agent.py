@@ -10,7 +10,6 @@ base_dir = os.path.dirname(os.path.abspath(__file__))
 project_path = os.path.join(base_dir, "project")
 sys.path.append(project_path)
 
-from core.rag_system import RAGSystem
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 import config
@@ -32,6 +31,14 @@ POD_ALPHA_NOTE_DEFAULT = (
 )
 POD_LETTERBOXING_DEFAULT = "avoid"
 
+
+def create_rag_system():
+    """Import the optional RAG stack only when an instance is requested."""
+    from core.rag_system import RAGSystem
+
+    return RAGSystem()
+
+
 # Max suggestions per field for `suggest_field_inputs` when the client does not override.
 SUGGEST_FIELD_DEFAULT_LIMITS: Dict[str, int] = {
     "subject": 3,
@@ -46,7 +53,7 @@ SUGGEST_FIELD_DEFAULT_LIMITS: Dict[str, int] = {
 class CreativeAgent:
     def __init__(self):
         print("Initializing Creative Agent...")
-        self.rag = RAGSystem()
+        self.rag = create_rag_system()
         self.rag.initialize()
         self.concept_timeout_seconds = int(os.getenv("FAST_TRACK_CONCEPT_TIMEOUT_SECONDS", "300"))
         self.concept_max_retries = int(os.getenv("FAST_TRACK_CONCEPT_MAX_RETRIES", "1"))
