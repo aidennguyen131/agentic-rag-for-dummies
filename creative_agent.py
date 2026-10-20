@@ -93,6 +93,7 @@ class CreativeAgent:
             "gpt 5.2": "gpt-5.2",
             "gpt-5-mini": "gpt-5-mini",
             "gpt 5 mini": "gpt-5-mini",
+            "gpt-6-sol": "gpt-6-sol",
         }
         self._allowed_concept_models = {
             "gemini-pro-latest",
@@ -101,6 +102,7 @@ class CreativeAgent:
             "gemini-pro-agent",
             "gpt-5.2",
             "gpt-5-mini",
+            "gpt-6-sol",
         }
         self._creative_llm_cache = {}
 
